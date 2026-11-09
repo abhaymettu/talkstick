@@ -80,6 +80,8 @@ EXIT_OFFLINE = 3
 STICK_REPLY_CHARS = 600
 KEEP_ANSWERS = 8
 KEEP_DELIVERED = 64
+ORPHAN_SENT = "The Mac restarted while waiting. The reply is in the thread."
+ORPHAN_UNSENT = "Not posted: the Mac restarted. Say it again."
 WATCH_TICK = 1.0
 HEARTBEAT_EVERY = 5
 STICK_LOG_BYTES = 1024
@@ -357,7 +359,7 @@ class Daemon:
             write_atomic(self.queue_file, json.dumps({
                 d: {"queue": [int(n) for n in self.queue_line(d).split()[1:]],
                     "items": [{"id": i.id, "state": i.report or ("waiting" if i.waiting else "sending"),
-                               "since": i.t_recv} for i in items.values()]}
+                               "since": i.t_recv, "said": i.said} for i in items.values()]}
                 for d, items in self.items.items() if items}).encode())
             line = self.queue_line(device)
             if self.queue_sent.get(device) != line:
@@ -370,6 +372,22 @@ class Daemon:
             self.items.setdefault(item.device, {})[item.id] = item
             self.items_changed(item.device)
         return item
+
+    def recover_orphans(self) -> None:
+        """Answer the items a previous run left in flight: their delivery commands died with it, so no reply will
+        come. Delivered ones say where the reply is; the rest ask to be said again."""
+        try:
+            left = json.loads(self.queue_file.read_text())
+        except (OSError, ValueError):
+            left = {}
+        with self.lock:
+            for device, q in (left.items() if isinstance(left, dict) else []):
+                for i in q.get("items") or []:
+                    item = Item(i["id"], device)
+                    item.said = i.get("said") or ""
+                    self.close_item(item, "error", ORPHAN_UNSENT if i.get("state") == "sending" else ORPHAN_SENT)
+                    self.log_event({"event": "orphaned", "id8": item.id, "device": device, "state": i.get("state")})
+            write_atomic(self.queue_file, b"{}")
 
     def mark_sent(self, item: Item) -> None:
         with self.lock:
@@ -683,7 +701,7 @@ class Daemon:
         self.state.mkdir(parents=True, exist_ok=True)
         state_file = self.state / "state.json"
         kill_stale_advertiser(state_file)
-        write_atomic(self.queue_file, b"{}")
+        self.recover_orphans()
         srv = self.make_server(("0.0.0.0", int(self.cfg["port"])))
         ticker_stop = threading.Event()
         threading.Thread(target=self.tick_forever, args=(ticker_stop,), daemon=True).start()

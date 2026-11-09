@@ -554,6 +554,29 @@ class Queue(unittest.TestCase):
         self.assertEqual([(r["rc"], r.get("decision")) for r in self.events(d, "on_reply")],
                          [("skipped", "skipped: acked by stick"), (0, "sent: not acked in 1.5 s")])
 
+    def test_restart_answers_items_left_in_flight(self):
+        d = self.daemon(["go"], slow=2)
+        t1, l1 = self.press(d, 200)
+        self.until(lambda: any(l.startswith("SENT") for l in l1))
+        t2, l2 = self.press(d, 100)
+        queue = self.tmp / "state/queue.json"
+        self.until(lambda: queue.exists() and '"sending"' in queue.read_text() and '"waiting"' in queue.read_text())
+        sent_id, unsent_id = l1[2].split()[1], l2[2].split()[1]
+        d2 = ts.Daemon(self.cfg)
+        d2.recover_orphans()
+        self.assertEqual(self.quick_watch(d2), [
+            "QUEUE 0 0 0 0",
+            f"ANSWER {sent_id} error utt200\t{ts.ORPHAN_SENT}",
+            f"ANSWER {unsent_id} error \t{ts.ORPHAN_UNSENT}"])
+        self.assertEqual(json.loads(queue.read_text()), {})
+        self.assertEqual(sorted((r["id8"], r["state"]) for r in self.events(d2, "orphaned")),
+                         sorted([(sent_id, "waiting"), (unsent_id, "sending")]))
+        self.assertEqual(ts.Daemon(self.cfg).answers, d2.answers)
+        self.touch("go-utt200")
+        self.touch("go-utt100")
+        t1.join(10)
+        t2.join(10)
+
     # Over-the-air updates
 
     def stage(self, version=None):
