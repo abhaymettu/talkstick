@@ -36,7 +36,6 @@ static constexpr uint32_t IDLE_SLEEP_MS = 60000;
 static constexpr uint32_t USB_DIM_MS = 10000;
 static constexpr uint32_t USB_PING_EVERY_MS = 5UL * 60UL * 1000UL;
 static constexpr uint32_t FAST_JOIN_MS = 4000;
-static constexpr uint32_t MIC_IDLE_OFF_MS = 400;
 
 static constexpr uint8_t BRIGHT_ACTIVE = 160;
 static constexpr uint8_t BRIGHT_DIM = 24;
@@ -92,7 +91,6 @@ struct Recorder {
   std::atomic<uint8_t> sound{(uint8_t)Sound::None};
   size_t queued_chunks = 0;
   bool mic_on = false;
-  uint32_t mic_idle_since = 0;
 };
 static Recorder rec;
 
@@ -115,7 +113,7 @@ static void recorder_task(void*) {
     if (raw != stable && (sim || now - last_change >= DEBOUNCE_MS)) pressed = raw;
 
     if (pressed && !stable && rec.armed.load() && !rec.active.load()) {
-      if (rtc_sound_on) play_tones(Sound::Listen);
+      // No click here: the speaker needs the codec, and restarting the mic after it loses about 0.9 s of speech.
       if (!rec.mic_on) rec.mic_on = M5.Mic.begin();
       rec.queued_chunks = 0;
       rec.done_bytes.store(0);
@@ -147,18 +145,16 @@ static void recorder_task(void*) {
       rec.done_bytes.store((rec.queued_chunks - in_flight) * CHUNK_BYTES);
       if (!rec.active.load() && in_flight == 0) {
         rec.finished.store(true);
-        rec.mic_idle_since = now;
       }
     }
-    if (rec.mic_on && rec.finished.load() && !rec.active.load() && now - rec.mic_idle_since > MIC_IDLE_OFF_MS) {
-      M5.Mic.end();
-      rec.mic_on = false;
-    }
     Sound s = (Sound)rec.sound.load();
-    if (s != Sound::None && !rec.mic_on && !rec.active.load()) {
+    if (s != Sound::None && rec.finished.load() && !rec.active.load()) {
       rec.sound.store((uint8_t)Sound::None);
+      if (rec.mic_on) { M5.Mic.end(); rec.mic_on = false; }
       play_tones(s);
     }
+    // The mic stays running while the stick is awake, so a press records at once.
+    if (!rec.mic_on && rec.finished.load() && !rec.active.load()) rec.mic_on = M5.Mic.begin();
     stable = pressed;
     vTaskDelay(1);
   }
@@ -339,6 +335,7 @@ struct IdleInfo {
 };
 static IdleInfo idle_info;
 static float mic_level = 0;
+static bool mic_live = false;  // a chunk with signal has arrived in this utterance
 static uint32_t phase_since_ms = 0;
 
 static String clock_text() {
@@ -359,7 +356,7 @@ static void render() {
     case ViewKind::Idle:
       key += "|" + clock_text() + String(idle_info.battery) + idle_info.usb + idle_info.wifi_bars + idle_info.mac_ok;
       break;
-    case ViewKind::Listening: key += "|" + String((int)(mic_level * 40)); break;
+    case ViewKind::Listening: key += "|" + String((int)(mic_level * 40)) + (mic_live ? "L" : "W"); break;
     case ViewKind::Thinking: key += "|" + String((now / 400) % 3); break;
     case ViewKind::Replied: case ViewKind::Reading: key += "|" + String(rtc_last_reply).substring(0, 24); break;
     default: break;
@@ -391,7 +388,7 @@ static void render() {
       break;
     }
     case ViewKind::Listening: {
-      draw_word("Listening", C_ORANGE);
+      draw_word(mic_live ? "Listening" : "Wait", mic_live ? C_ORANGE : C_DIM);
       int bar_w = W - 2 * M;
       canvas.fillRect(M, 68, bar_w, 10, C_TRACK);
       int fill = (int)(bar_w * mic_level);
@@ -832,11 +829,12 @@ static void press_b() {
 
 static void update_mic_level() {
   size_t done = rec.done_bytes.load();
-  if (done < CHUNK_BYTES) { mic_level = 0; return; }
+  if (done < CHUNK_BYTES) { mic_level = 0; mic_live = false; return; }
   const int16_t* chunk = rec.buf + (done / CHUNK_BYTES - 1) * CHUNK_SAMPLES;
   double sum = 0;
   for (size_t i = 0; i < CHUNK_SAMPLES; i++) sum += (double)chunk[i] * chunk[i];
   double rms = sqrt(sum / CHUNK_SAMPLES);
+  if (rms > 0) mic_live = true;
   float db = rms > 1 ? 20.0f * log10f(rms / 32768.0f) : -90.0f;
   float level = (db + 60.0f) / 60.0f;
   mic_level = level < 0 ? 0 : (level > 1 ? 1 : level);
