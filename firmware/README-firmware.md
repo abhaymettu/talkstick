@@ -36,7 +36,7 @@ Okabe-Ito set. Every screen is named by its word or its shape, so the colour nev
 | Idle | battery outline, fill and % (plus `usb` when plugged in) | says how much charge is left and whether it will sleep |
 | Idle | four WiFi bars, or `no wifi` | says how strong the WiFi link is |
 | Idle | `Mac` or `no Mac` | says whether a message would reach the Mac right now |
-| Listening | `Listening` in orange | says the mic is recording |
+| Listening | `Wait` in grey, then `Listening` in orange | says whether the mic is already recording (`Wait` only right after a deep-sleep wake) |
 | Listening | level bar | shows the mic is hearing you |
 | Listening | seconds held, `ends in N s` from 100 s | warns before the 120 s cap |
 | Sent | `Sent` in sky blue | says the audio left the stick |
@@ -50,7 +50,7 @@ Okabe-Ito set. Every screen is named by its word or its shape, so the colour nev
 | Problem | reason line | says why, in a few words |
 | Cancelled | `Cancelled` in grey | confirms button B dropped the recording |
 
-Clicks, all quiet: listening is one short high tick, sent is two ticks, replied is a rising pair, a problem is one
+Clicks, all quiet: sent is two ticks, replied is a rising pair, a problem is one
 low tone. `sound off` on the serial console turns them off (kept across sleep).
 
 ## Behaviour
@@ -101,6 +101,7 @@ run `flash.sh` again.
 | `state` | prints the current screen and phase |
 | `status` | version, phase, WiFi, target, battery, VBUS, G11 level, clock |
 | `ping` | pings the Mac now |
+| `scan` | reports whether the configured WiFi name is visible (exact or case-only match), channel, signal, security; never prints names |
 | `gpio` | G11 level with and without the internal pull-up |
 | `sound on`, `sound off` | clicks on or off |
 | `sleep` | deep-sleep now (wake with button A) |

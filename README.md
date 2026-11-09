@@ -28,11 +28,13 @@ whisper.cpp and the default delivery just prints the text.
 
 ## What it does
 
-- **Hold A** to talk. Audio is buffered from the instant you press, so the first word is not lost while WiFi wakes.
+- **Hold A** to talk. The mic runs while the stick is awake, so recording starts the instant you press; after a
+  deep-sleep wake the screen says *Wait* for about a second until audio flows, then *Listening*.
 - **Release** and the stick shows *Sent*, then *Thinking* with the elapsed time, then the reply itself.
 - **Tap A** sends a status question you set in the config (for example "one line on what is running").
 - **B while talking** cancels. **B otherwise** shows the last reply again and pages through it.
-- Quiet, distinct clicks for listening, sent, replied and problems (`sound off` on the serial console mutes them).
+- Quiet, distinct clicks for sent, replied and problems (`sound off` on the serial console mutes them). There is no
+  click on press: the speaker shares the codec with the mic, and restarting the mic after a click cost 0.9 s of speech.
 - Idle screen: clock (from the daemon, no internet needed), battery, WiFi strength, and whether the daemon is reachable.
 - On battery it deep-sleeps when idle and wakes on button A; on USB it stays awake with the screen dimmed.
 
@@ -150,17 +152,19 @@ The wire protocol (M5R1) is small enough to implement on another device: [docs/p
 
 ## Limits
 
-- **Latency.** Release to transcript is about 0.3 to 0.5 s with whisper base.en on an Apple Silicon Mac; the rest is
-  your target. Measured from a simulated stick on the LAN, release to a short agent reply in a T3 thread took 7.3 to
-  7.5 s over six tries.
+- **Latency.** Measured on a real stick over home WiFi with whisper base.en on an Apple Silicon Mac: release to
+  transcript 0.3 to 0.4 s, release to the text arriving at the target 0.85 to 0.92 s. Everything after that is your
+  target's own time (a short reply from an idle agent in a T3 thread came back 7.3 s after release).
 - **Battery.** 250 mAh. Deep sleep between uses; WiFi is on only while talking and waiting for the reply (up to 11
   minutes). Battery life per charge has not been measured yet.
 - **Range.** Ordinary 2.4 GHz WiFi; the stick and the computer must be on the same network.
-- **One talker.** The daemon handles one utterance at a time; a second waits for the first.
+- **One talker.** The daemon handles one utterance at a time; a second press waits until the first reply is in.
 - **Wispr Flow engine** (`wispr-macos`) is experimental: it drives Wispr Flow's deep links and plays audio into a
   BlackHole virtual mic, needs the user idle while it runs, and can paste into the focused app. Use whisper unless
   you know you want it.
-- **Mic and speaker** share one codec, so clicks play only before and after recording.
+- **Mic and speaker** share one codec, so clicks play only after a recording.
+- **WiFi names are case sensitive.** If the idle screen says *no wifi*, check the exact capitalisation of the network
+  name; `scan` on the serial console reports whether a network with that name is visible.
 
 ## Hardware notes
 
