@@ -20,7 +20,7 @@
 static const uint8_t OTA_KEY[32] = TS_OTA_KEY;
 #endif
 
-static constexpr const char* FW_VERSION = "talkstick-0.3.0";
+static constexpr const char* FW_VERSION = "talkstick-0.3.2";
 
 static constexpr gpio_num_t PTT_PIN = GPIO_NUM_11;
 static constexpr int PRESSED_LEVEL = 0;
@@ -381,11 +381,11 @@ static M5Canvas canvas(&M5.Display);
 static constexpr uint16_t rgb(uint32_t hex) {
   return (uint16_t)(((hex >> 8) & 0xF800) | ((hex >> 5) & 0x07E0) | ((hex >> 3) & 0x001F));
 }
-static constexpr uint16_t C_BG = rgb(0x0C0C0E);
+static constexpr uint16_t C_BG = rgb(0x101010);
 static constexpr uint16_t C_TEXT = rgb(0xEDEDED);
 static constexpr uint16_t C_DIM = rgb(0x9A9A9E);
 static constexpr uint16_t C_FAINT = rgb(0x5E5E63);
-static constexpr uint16_t C_TRACK = rgb(0x26262A);
+static constexpr uint16_t C_TRACK = rgb(0x242424);
 static constexpr uint16_t C_YELLOW = rgb(0xF0E442);
 static constexpr uint16_t C_ORANGE = rgb(0xE69F00);
 static constexpr uint16_t C_SKY = rgb(0x56B4E9);
@@ -1000,9 +1000,12 @@ static void ota_run(IPAddress ip, uint16_t port) {
     String partial, head;
     bool line_got = false;
     uint32_t t0 = millis();
-    while (!line_got && millis() - t0 < 10000 && (c.connected() || c.available())) {
+    // The daemon answers every hello with TIME first; the image header is the first IMAGE or ERR line.
+    while (millis() - t0 < 10000 && (c.connected() || c.available())) {
       head = read_line_from(c, partial, line_got);
-      if (!line_got) delay(5);
+      if (line_got && (head.startsWith("IMAGE ") || head.startsWith("ERR"))) break;
+      line_got = false;
+      delay(5);
     }
     unsigned size = 0;
     char sha[65] = "";
@@ -1746,7 +1749,7 @@ static bool make_demo(const String& name, Screen& out) {
   else if (name == "notheard") out = scr_problem("Didn't catch that", "Nothing was heard", "Hold A a little longer");
   else if (name == "offline") out = scr_problem("Driver offline", "No live driver thread", "Nothing was posted");
   else if (name == "cancelled") out = scr_cancelled();
-  else if (name == "updating") out = scr_updating("talkstick-0.3.1", 42, false);
+  else if (name == "updating") out = scr_updating("talkstick-0.3.2", 42, false);
   else return false;
   return true;
 }

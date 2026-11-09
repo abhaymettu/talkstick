@@ -31,7 +31,7 @@ def build(ttf: Path, size: int, chars: str, tracking: int):
     track = round(size * tracking / 1000)
     digit_adv = max(round(font.getlength(d)) for d in "0123456789")
     glyphs = []
-    for ch in chars:
+    for ch in sorted(set(chars)):
         adv = round(font.getlength(ch))
         x0, y0, x1, y1 = font.getbbox(ch, anchor="ls")
         w, h = max(0, x1 - x0), max(0, y1 - y0)
