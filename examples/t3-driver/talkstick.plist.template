@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Replace __LABEL__, __TALKSTICK__ (absolute path to daemon/talkstick), __CONFIG__, __HOME__, __T3_BIN__ and
+     __T3_THREAD_FILE__, then copy to ~/Library/LaunchAgents/__LABEL__.plist and run
+     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/__LABEL__.plist -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>__LABEL__</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/bin/python3</string>
+		<string>-I</string>
+		<string>__TALKSTICK__</string>
+		<string>serve</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>TALKSTICK_CONFIG</key>
+		<string>__CONFIG__</string>
+		<key>T3_BIN</key>
+		<string>__T3_BIN__</string>
+		<key>T3_THREAD_FILE</key>
+		<string>__T3_THREAD_FILE__</string>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>StandardOutPath</key>
+	<string>__HOME__/.local/state/talkstick/daemon.log</string>
+	<key>StandardErrorPath</key>
+	<string>__HOME__/.local/state/talkstick/daemon.log</string>
+</dict>
+</plist>

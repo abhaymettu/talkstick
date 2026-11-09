@@ -1,0 +1,15 @@
+{
+  "engine": {
+    "type": "whisper",
+    "whisper": {"binary": "whisper-cli", "model": "~/models/whisper/ggml-base.en.bin"}
+  },
+  "delivery": {
+    "type": "command",
+    "command": {"argv": ["python3", "/path/to/talkstick/examples/t3-driver/deliver.py"], "timeout": 660}
+  },
+  "on_reply": ["/path/to/your/notify-phone-script"],
+  "offline_message": "agent thread offline",
+  "reply_max_chars": 600,
+  "reply_more_suffix": " (more in T3)",
+  "dry": true
+}

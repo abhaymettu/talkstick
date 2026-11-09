@@ -1,0 +1,4 @@
+{
+  "engine": {"type": "whisper"},
+  "delivery": {"type": "webhook", "webhook": {"url": "http://127.0.0.1:8787/", "timeout": 30}}
+}

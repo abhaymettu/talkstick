@@ -1,0 +1,66 @@
+{
+  "_about": "talkstick config. Copy to ~/.config/talkstick/config.json or point TALKSTICK_CONFIG at it. Every key is optional; these are the defaults except where _note says otherwise.",
+
+  "port": 47820,
+  "service_name": "talkstick",
+  "service_type": "_m5remote._tcp",
+  "advertise": true,
+  "state_dir": "~/.local/state/talkstick",
+  "keep_utterances": 20,
+  "dry": false,
+
+  "engine": {
+    "_types": "whisper (whisper.cpp), command (your own transcriber), wispr-macos (EXPERIMENTAL, macOS only, drives the Wispr Flow app)",
+    "type": "whisper",
+    "whisper": {
+      "binary": "whisper-cli",
+      "model": "~/.local/share/talkstick/ggml-base.en.bin",
+      "extra_args": ["-t", "4"]
+    },
+    "command": {
+      "_contract": "{wav} is replaced by the utterance path (16 kHz mono s16 WAV); stdout is the transcript; nonzero exit = ERR",
+      "argv": ["my-transcriber", "--file", "{wav}"],
+      "timeout": 120
+    },
+    "wispr-macos": {
+      "_warning": "EXPERIMENTAL. Plays audio into a loopback device (BlackHole) while Wispr's mic is set to it, with talkstick's sink window in front, only while you have been idle idle_seconds. Wispr has been seen to record the previous front app as its paste target, so verify before use. Build the sink once with: talkstick build-sink",
+      "app_support": "~/Library/Application Support/Wispr Flow",
+      "loopback_mic": "BlackHole",
+      "ffmpeg": "ffmpeg",
+      "sink_app": "~/.local/share/talkstick/TalkstickSink.app",
+      "sink_bundle_id": "io.github.talkstick.sink",
+      "idle_seconds": 10,
+      "idle_wait": 20,
+      "fallback": null,
+      "_fallback": "set to \"whisper\" to transcribe with engine.whisper when Wispr fails or you are active"
+    }
+  },
+
+  "delivery": {
+    "_types": "print (stdout), command, webhook",
+    "type": "print",
+    "command": {
+      "_contract": "transcript on stdin; print a line @sent once delivered (stick shows SENT); everything else printed is the reply; exit 0 = REPLIED, exit 3 = target offline (OFFLINE), other nonzero = ERR. Env: TALKSTICK_DEVICE, TALKSTICK_UTTERANCE_ID, TALKSTICK_DRY (1 = do not deliver)",
+      "argv": ["python3", "/path/to/my-deliver.py"],
+      "timeout": 660
+    },
+    "webhook": {
+      "_contract": "POST {\"text\", \"device\", \"utterance_id\", \"dry\"}; reply = JSON {\"reply\": \"...\"} or a plain-text body; 503 = offline; other non-2xx = ERR",
+      "url": "",
+      "headers": {},
+      "timeout": 660
+    }
+  },
+
+  "on_reply": null,
+  "_on_reply": "argv run with the reply on stdin, e.g. [\"notify-send\", \"talkstick\"] or a script that texts your phone; printed instead of run in dry mode",
+  "offline_message": null,
+  "_offline_message": "if set, sent through on_reply when the target is offline",
+  "reply_max_chars": null,
+  "reply_more_suffix": " (more)",
+  "_reply_max_chars": "trim for on_reply only; the stick's REPLY line has its own cap, stick_reply_chars",
+
+  "status_prompt": null,
+  "_status_prompt": "text sent through delivery when the stick sends S (a short press), e.g. \"status: one line on what is running and what needs me\"; unset = the stick gets ERR",
+  "stick_reply_chars": 600
+}

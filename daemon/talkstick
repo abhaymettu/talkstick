@@ -1,0 +1,873 @@
+#!/usr/bin/env python3
+"""talkstick: push-to-talk from an M5StickS3 (or anything speaking M5R1) to a command, a webhook or stdout.
+
+Usage: talkstick [serve | bench WAV | fake-stick (WAV | --status | --ping) [HOST[:PORT]] | status | build-sink] [--dry]
+Config: JSON at $TALKSTICK_CONFIG, else ~/.config/talkstick/config.json. See config.example.json.
+
+Wire protocol M5R1 (one TCP connection per utterance, stick to daemon):
+  stick sends  "M5R1 <device-id> <battery%> <fw-version>\\n", then frames of
+               1 byte type + 2 bytes little-endian length + payload:
+               A = audio (s16le PCM, 16 kHz, mono, up to 4096 bytes), E = end of utterance, C = cancel,
+               S = status request (runs config status_prompt through delivery instead of audio),
+               P = ping (daemon answers TIME and LAST, then closes).
+  daemon sends UTF-8 lines: TIME <epoch> <utc-offset-s> (right after HELLO), RECV, WAIT <s>,
+               SENT [first 40 chars], REPLY <text> (just before REPLIED), REPLIED, OFFLINE, ERR <reason>,
+               LAST <text> (on ping, the last reply). REPLY and LAST text: at most stick_reply_chars (600)
+               characters, newlines written as the two characters \\n.
+
+Delivery contract
+  print    The transcript is printed to the daemon's stdout. The stick sees SENT, then REPLIED.
+  command  argv runs with the transcript on stdin (stdin is then closed). Env: TALKSTICK_DEVICE,
+           TALKSTICK_UTTERANCE_ID, TALKSTICK_DRY ("1" in dry mode; the command must then not deliver).
+           A stdout line "@sent" means the text was delivered: the stick sees SENT right away.
+           Everything else on stdout is the reply. Exit 0 = REPLIED, exit 3 = target offline (OFFLINE),
+           any other exit = ERR. No "@sent" before exit 0 means SENT is sent at exit.
+  webhook  POST url with JSON {"text", "device", "utterance_id", "dry"}. A JSON body {"reply": "..."}
+           or a plain-text body is the reply. 503 = offline. Other non-2xx = ERR.
+  on_reply Optional argv run with the reply on stdin, trimmed to reply_max_chars plus reply_more_suffix.
+           In dry mode it is printed, not run. offline_message, if set, goes through on_reply on OFFLINE.
+"""
+from __future__ import annotations
+
+import json
+import os
+import plistlib
+import re
+import shutil
+import signal
+import socket
+import socketserver
+import sqlite3
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+import wave
+from pathlib import Path
+from urllib.parse import quote
+
+RATE = 16000
+MAX_AUDIO_BYTES = RATE * 2 * 125
+KEEP_UTTERANCES = 20
+EXIT_OFFLINE = 3
+STICK_REPLY_CHARS = 600
+
+DEFAULTS: dict = {
+    "port": 47820,
+    "service_name": "talkstick",
+    "service_type": "_m5remote._tcp",
+    "advertise": True,
+    "state_dir": "~/.local/state/talkstick",
+    "keep_utterances": KEEP_UTTERANCES,
+    "dry": False,
+    "engine": {
+        "type": "whisper",
+        "whisper": {"binary": "whisper-cli", "model": "~/.local/share/talkstick/ggml-base.en.bin",
+                    "extra_args": ["-t", "4"]},
+        "command": {"argv": [], "timeout": 120},
+        "wispr-macos": {
+            "app_support": "~/Library/Application Support/Wispr Flow",
+            "loopback_mic": "BlackHole",
+            "ffmpeg": "ffmpeg",
+            "sink_app": "~/.local/share/talkstick/TalkstickSink.app",
+            "sink_bundle_id": "io.github.talkstick.sink",
+            "idle_seconds": 10,
+            "idle_wait": 20,
+            "fallback": None,
+        },
+    },
+    "delivery": {
+        "type": "print",
+        "command": {"argv": [], "timeout": 660},
+        "webhook": {"url": "", "headers": {}, "timeout": 660},
+    },
+    "on_reply": None,
+    "offline_message": None,
+    "reply_max_chars": None,
+    "reply_more_suffix": " (more)",
+    "status_prompt": None,
+    "stick_reply_chars": STICK_REPLY_CHARS,
+}
+
+
+def merge(base: dict, over: dict) -> dict:
+    out = dict(base)
+    for k, v in over.items():
+        out[k] = merge(base[k], v) if isinstance(v, dict) and isinstance(base.get(k), dict) else v
+    return out
+
+
+def config_path() -> Path:
+    return Path(os.environ.get("TALKSTICK_CONFIG") or "~/.config/talkstick/config.json").expanduser()
+
+
+def load_config(path: Path | None = None) -> dict:
+    path = path or config_path()
+    cfg = merge(DEFAULTS, json.loads(path.read_text())) if path.exists() else dict(DEFAULTS)
+    if os.environ.get("TALKSTICK_DRY") == "1":
+        cfg["dry"] = True
+    return cfg
+
+
+def expand(p: str) -> Path:
+    return Path(os.path.expandvars(p)).expanduser()
+
+
+def which(binary: str) -> str:
+    if "/" in binary:
+        return str(expand(binary))
+    found = shutil.which(binary, path=os.environ.get("PATH", "") + ":/opt/homebrew/bin:/usr/local/bin:/usr/bin")
+    if not found:
+        raise StepError(f"{binary} not found")
+    return found
+
+
+def now() -> float:
+    return time.time()
+
+
+def run(cmd: list[str], timeout: float = 30, stdin: str | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=timeout)
+
+
+class StepError(Exception):
+    """A failure the stick shows as `ERR <reason>`."""
+
+
+class Offline(Exception):
+    """The delivery target is down; the stick shows OFFLINE."""
+
+
+class Daemon:
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.state = expand(cfg["state_dir"])
+        self.events = self.state / "events.jsonl"
+        self.events_lock = threading.Lock()
+        self.work_lock = threading.Lock()
+
+    @property
+    def dry(self) -> bool:
+        return bool(self.cfg["dry"])
+
+    def log_event(self, row: dict) -> None:
+        self.state.mkdir(parents=True, exist_ok=True)
+        row = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), **row}
+        with self.events_lock, open(self.events, "a") as f:
+            f.write(json.dumps(row) + "\n")
+
+    # Transcription
+
+    def transcribe(self, wav: Path, status, rec: dict) -> str:
+        eng = self.cfg["engine"]
+        kind = eng["type"]
+        rec["engine"] = kind
+        if kind == "whisper":
+            return whisper_transcribe(eng["whisper"], wav)
+        if kind == "command":
+            return command_transcribe(eng["command"], wav)
+        if kind == "wispr-macos":
+            wcfg = eng["wispr-macos"]
+            try:
+                return WisprMac(wcfg, self.log_event).transcribe(wav, status, rec)
+            except (StepError, UserActive) as e:
+                if wcfg.get("fallback") != "whisper":
+                    raise StepError("mac busy" if isinstance(e, UserActive) else str(e))
+                rec["engine"], rec["wispr_skipped"] = "whisper", str(e) or "user active"
+                return whisper_transcribe(eng["whisper"], wav)
+        raise StepError(f"engine {kind}?")
+
+    # Delivery
+
+    def deliver(self, text: str, status, rec: dict) -> str:
+        d = self.cfg["delivery"]
+        kind = d["type"]
+        rec["delivery"] = kind
+        if kind == "print":
+            print(f"[talkstick] {rec.get('device')}: {text}", flush=True)
+            status(f"SENT {text[:40]}")
+            rec["t_sent"] = now()
+            return ""
+        if kind == "command":
+            return deliver_command(d["command"], text, rec, self.dry, lambda: self._sent(text, status, rec))
+        if kind == "webhook":
+            reply = deliver_webhook(d["webhook"], text, rec, self.dry)
+            self._sent(text, status, rec)
+            return reply
+        raise StepError(f"delivery {kind}?")
+
+    def _sent(self, text: str, status, rec: dict) -> None:
+        if "t_sent" not in rec:
+            rec["t_sent"] = now()
+            status(f"SENT {text[:40]}")
+
+    def on_reply(self, reply: str, rec: dict) -> None:
+        argv = self.cfg.get("on_reply")
+        if not argv or not reply.strip():
+            return
+        msg = trim_reply(reply, self.cfg["reply_max_chars"], self.cfg["reply_more_suffix"])
+        if self.dry:
+            print(f"[dry] on_reply {argv[0]} <- {len(msg)} chars", flush=True)
+            rec["on_reply_rc"] = "dry"
+            return
+        p = subprocess.run(argv, input=msg, capture_output=True, text=True, timeout=60)
+        rec["on_reply_rc"] = p.returncode
+        if p.returncode != 0:
+            self.log_event({"event": "on_reply_failed", "rc": p.returncode, "stderr": p.stderr.strip()[-200:]})
+            raise StepError("on_reply failed")
+
+    # Pipeline
+
+    def save_wav(self, pcm: bytes, uid: str) -> Path:
+        d = self.state / "utterances"
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / f"{time.strftime('%Y%m%d-%H%M%S')}-{uid[:8]}.wav"
+        with wave.open(str(path), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(RATE)
+            w.writeframes(pcm)
+        keep = int(self.cfg["keep_utterances"])
+        for old in sorted(d.glob("*.wav"))[:-keep]:
+            old.unlink()
+        return path
+
+    @property
+    def last_reply_file(self) -> Path:
+        return self.state / "last_reply.txt"
+
+    def last_reply(self) -> str:
+        try:
+            return self.last_reply_file.read_text().strip()
+        except OSError:
+            return ""
+
+    def send_reply_to_stick(self, reply: str, status) -> None:
+        line = stick_line(reply, int(self.cfg["stick_reply_chars"]))
+        if line:
+            self.state.mkdir(parents=True, exist_ok=True)
+            self.last_reply_file.write_text(line + "\n")
+            status(f"REPLY {line}")
+
+    def process(self, get_text, status, rec: dict) -> None:
+        """Get the text (transcribe, or the status prompt), deliver, hand the reply on; `rec` collects the
+        timings written to events.jsonl."""
+        with self.work_lock:
+            try:
+                text = get_text()
+                rec["t_transcript"] = now()
+                rec["transcript_chars"] = len(text)
+                if not text:
+                    raise StepError("empty transcript")
+                reply = self.deliver(text, status, rec)
+                rec["t_reply"] = now()
+                rec["reply_chars"] = len(reply)
+                self.on_reply(reply, rec)
+                self.send_reply_to_stick(reply, status)
+                rec["t_done"] = now()
+                rec["outcome"] = "replied"
+                status("REPLIED")
+            except Offline:
+                rec["outcome"] = "offline"
+                msg = self.cfg.get("offline_message")
+                try:
+                    if msg:
+                        self.on_reply(msg, rec)
+                except StepError as e:
+                    rec["error"] = str(e)
+                status("OFFLINE")
+            except StepError as e:
+                rec["outcome"], rec["error"] = "error", str(e)
+                status(f"ERR {e}"[:60])
+            except Exception as e:
+                rec["outcome"], rec["error"] = "error", f"{type(e).__name__}: {e}"[:200]
+                status("ERR internal")
+            finally:
+                r = rec.get("t_release")
+                for k in ("t_transcript", "t_sent", "t_reply", "t_done"):
+                    if r and rec.get(k):
+                        rec["d_" + k[2:]] = round(rec[k] - r, 3)
+                rec["dry"] = self.dry
+                self.log_event({"event": "utterance", **rec})
+
+    # Server
+
+    def serve(self) -> None:
+        self.state.mkdir(parents=True, exist_ok=True)
+        state_file = self.state / "state.json"
+        kill_stale_advertiser(state_file)
+        daemon = self
+
+        class Handler(socketserver.StreamRequestHandler):
+            def status(self, line: str) -> None:
+                try:
+                    self.wfile.write((line + "\n").encode())
+                    self.wfile.flush()
+                except OSError:
+                    pass
+
+            def handle(self) -> None:
+                self.request.settimeout(150)
+                daemon.handle_stick(self.rfile, self.status, self.client_address[0])
+
+        srv = Server(("0.0.0.0", int(self.cfg["port"])), Handler)
+        adv = None
+        if self.cfg["advertise"]:
+            adv = advertise(self.cfg["service_name"], self.cfg["service_type"], int(self.cfg["port"]))
+        state_file.write_text(json.dumps({
+            "pid": os.getpid(), "advertiser_pid": adv.pid if adv else None, "port": self.cfg["port"],
+            "engine": self.cfg["engine"]["type"], "delivery": self.cfg["delivery"]["type"], "dry": self.dry,
+            "started": time.strftime("%Y-%m-%dT%H:%M:%S%z")}))
+
+        def stop(*_):
+            if adv:
+                adv.terminate()
+            threading.Thread(target=srv.shutdown, daemon=True).start()
+
+        signal.signal(signal.SIGTERM, stop)
+        signal.signal(signal.SIGINT, stop)
+        self.log_event({"event": "start", "engine": self.cfg["engine"]["type"],
+                        "delivery": self.cfg["delivery"]["type"], "dry": self.dry, "pid": os.getpid()})
+        try:
+            srv.serve_forever()
+        finally:
+            if adv:
+                adv.terminate()
+            srv.server_close()
+            self.log_event({"event": "stop"})
+
+    def handle_stick(self, rfile, status, peer: str) -> None:
+        rec: dict = {"peer": peer, "utterance_id": uuid.uuid4().hex}
+        try:
+            u = read_utterance(rfile, on_header=lambda _: status(time_line()))
+        except (socket.timeout, OSError) as e:
+            self.log_event({"event": "dropped", "reason": type(e).__name__, **rec})
+            return
+        rec.update(u.header)
+        if u.outcome == "ping":
+            last = self.last_reply()
+            if last:
+                status(f"LAST {last}")
+            return
+        if u.outcome == "status":
+            rec["kind"], rec["t_release"] = "status", now()
+            prompt = self.cfg.get("status_prompt")
+            if not prompt:
+                status("ERR no status_prompt")
+                self.log_event({"event": "status_unconfigured", **rec})
+                return
+            status("RECV")
+            self.process(lambda: prompt, status, rec)
+            return
+        if u.outcome == "too_long":
+            status("ERR too long")
+        if u.outcome != "end":
+            self.log_event({"event": u.outcome, "bytes": len(u.pcm), **rec})
+            return
+        rec["kind"], rec["t_release"] = "utterance", now()
+        rec["audio_s"] = round(len(u.pcm) / (RATE * 2), 2)
+        wav = self.save_wav(u.pcm, rec["utterance_id"])
+        rec["wav"] = wav.name
+        status("RECV")
+        self.process(lambda: self.transcribe(wav, status, rec), status, rec)
+
+
+class Server(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+class Utterance:
+    def __init__(self, outcome: str, header: dict, pcm: bytes):
+        self.outcome, self.header, self.pcm = outcome, header, pcm
+
+
+def read_utterance(rfile, on_header=None) -> Utterance:
+    """Parse one M5R1 connection. outcome: end | status | ping | cancel | bad_header | truncated | too_long.
+    on_header(header) runs as soon as the HELLO line parses, before any frame is read."""
+    words = rfile.readline(200).decode("ascii", "replace").split()
+    if len(words) < 2 or words[0] != "M5R1":
+        return Utterance("bad_header", {}, b"")
+    header = {"device": words[1], "battery": words[2] if len(words) > 2 else None,
+              "fw": words[3] if len(words) > 3 else None, "t_connect": now()}
+    if on_header:
+        on_header(header)
+    pcm = bytearray()
+    while True:
+        head = rfile.read(3)
+        if len(head) < 3:
+            return Utterance("truncated", header, bytes(pcm))
+        kind, length = head[:1], struct.unpack("<H", head[1:])[0]
+        payload = rfile.read(length) if length else b""
+        if len(payload) < length:
+            return Utterance("truncated", header, bytes(pcm))
+        if kind == b"A":
+            pcm += payload
+            if len(pcm) > MAX_AUDIO_BYTES:
+                return Utterance("too_long", header, bytes(pcm))
+        elif kind == b"C":
+            return Utterance("cancel", header, bytes(pcm))
+        elif kind == b"E":
+            return Utterance("end", header, bytes(pcm))
+        elif kind == b"S":
+            return Utterance("status", header, b"")
+        elif kind == b"P":
+            return Utterance("ping", header, b"")
+
+
+def time_line(t: float | None = None) -> str:
+    t = now() if t is None else t
+    return f"TIME {int(t)} {time.localtime(t).tm_gmtoff}"
+
+
+def stick_line(text: str, max_chars: int = STICK_REPLY_CHARS) -> str:
+    """One protocol line of at most max_chars characters after encoding; a newline is written as the two
+    characters \\n and is never cut in half."""
+    out, size = [], 0
+    for ch in text.strip().replace("\r\n", "\n").replace("\r", "\n"):
+        piece = "\\n" if ch == "\n" else ch
+        if size + len(piece) > max_chars:
+            break
+        out.append(piece)
+        size += len(piece)
+    return "".join(out).rstrip()
+
+
+def trim_reply(text: str, max_chars: int | None, suffix: str) -> str:
+    text = text.strip()
+    if not max_chars or len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + suffix
+
+
+# Engines
+
+def whisper_transcribe(wcfg: dict, wav: Path) -> str:
+    model = expand(wcfg["model"])
+    if not model.exists():
+        raise StepError("whisper model missing")
+    p = run([which(wcfg["binary"]), "-m", str(model), "-f", str(wav), "-nt", "-np", *wcfg.get("extra_args", [])],
+            timeout=120)
+    if p.returncode != 0:
+        raise StepError("whisper failed")
+    text = " ".join(p.stdout.split())
+    return re.sub(r"\[(BLANK_AUDIO|MUSIC|SILENCE)\]|\(.*?\)", "", text).strip()
+
+
+def command_transcribe(ccfg: dict, wav: Path) -> str:
+    argv = [a.replace("{wav}", str(wav)) for a in ccfg["argv"]]
+    if not argv:
+        raise StepError("engine argv empty")
+    p = run(argv, timeout=float(ccfg.get("timeout", 120)))
+    if p.returncode != 0:
+        raise StepError(f"engine exit {p.returncode}")
+    return " ".join(p.stdout.split())
+
+
+class UserActive(Exception):
+    pass
+
+
+class WisprMac:
+    """EXPERIMENTAL, macOS only. Drives the Wispr Flow app: plays the utterance into a loopback device (BlackHole)
+    while Wispr's mic is set to it, with talkstick's own sink window frontmost so Wispr's paste lands there, then
+    reads the transcript from Wispr's history database (read-only). It only runs while the person has not touched
+    keyboard or mouse for idle_seconds, re-checks that throughout, and restores their front app and Wispr mic.
+    No synthetic keystrokes and no permission grants. Known issue: Wispr has been seen to record the previous front
+    app as the paste target even with the sink in front, so verify the paste target before relying on it."""
+
+    def __init__(self, wcfg: dict, log_event):
+        self.c = wcfg
+        self.log_event = log_event
+        self.support = expand(wcfg["app_support"])
+        self.sink_app = expand(wcfg["sink_app"])
+        self.sink_id = wcfg["sink_bundle_id"]
+
+    @staticmethod
+    def hid_idle() -> float:
+        m = re.search(r'"HIDIdleTime" = (\d+)', run(["/usr/sbin/ioreg", "-c", "IOHIDSystem", "-d", "4"]).stdout)
+        return int(m.group(1)) / 1e9 if m else 0.0
+
+    def user_active(self) -> bool:
+        return self.hid_idle() < 3.0
+
+    @staticmethod
+    def front_bundle() -> str | None:
+        asn = run(["/usr/bin/lsappinfo", "front"]).stdout.strip()
+        if not asn:
+            return None
+        out = run(["/usr/bin/lsappinfo", "info", "-only", "bundleid", asn]).stdout
+        m = re.search(r'"CFBundleIdentifier"="([^"]+)"', out)
+        return m.group(1) if m else None
+
+    @staticmethod
+    def bundle_pid(bundle: str) -> int | None:
+        m = re.search(r'"pid"=(\d+)', run(["/usr/bin/lsappinfo", "info", "-only", "pid", "-app", bundle]).stdout)
+        return int(m.group(1)) if m else None
+
+    @staticmethod
+    def open_link(path: str) -> None:
+        run(["/usr/bin/open", "-g", "wispr-flow://" + path])
+
+    def prefs(self) -> dict:
+        return json.loads((self.support / "config.json").read_text()).get("prefs", {}).get("user", {})
+
+    def mic(self) -> tuple[str | None, str | None]:
+        user = self.prefs()
+        dev = user.get("overrideAudioDeviceId")
+        names = {d.get("deviceId"): d.get("name") for d in user.get("rankedAudioDevices") or []}
+        return dev, names.get(dev)
+
+    def ranked_names(self) -> list[str]:
+        loop = self.c["loopback_mic"]
+        return [d["name"] for d in self.prefs().get("rankedAudioDevices") or []
+                if d.get("name") and not d["name"].startswith(loop) and d.get("deviceId") != "default"]
+
+    def switch_mic(self, prefix: str) -> None:
+        self.open_link("switch-mic?mic_name=" + quote(prefix))
+
+    def restore_mic(self, prev_dev: str | None, prev_name: str | None) -> None:
+        """The previous mic first; if it is gone, the next ranked mic, never the loopback."""
+        for name in ([prev_name] if prev_name else []) + [n for n in self.ranked_names() if n != prev_name]:
+            self.switch_mic(name)
+            for _ in range(10):
+                time.sleep(0.2)
+                dev, cur = self.mic()
+                if dev == prev_dev or cur == name:
+                    return
+        self.log_event({"event": "wispr_mic_restore_failed"})
+
+    def db(self) -> sqlite3.Connection:
+        return sqlite3.connect(f"file:{quote(str(self.support / 'flow.sqlite'))}?mode=ro", uri=True, timeout=5)
+
+    def last_ts(self) -> str:
+        with self.db() as c:
+            return c.execute("select max(timestamp) from History").fetchone()[0] or ""
+
+    def new_row(self, after: str) -> tuple | None:
+        """(status, text, app) of the newest History row since `after`; `app` is where Wispr pasted."""
+        with self.db() as c:
+            return c.execute(
+                "select status, coalesce(nullif(formattedText,''), asrText, ''), coalesce(app,'') from History"
+                " where timestamp > ? and status is not null order by timestamp desc limit 1", (after,)).fetchone()
+
+    def loopback_index(self) -> int:
+        p = run([which(self.c["ffmpeg"]), "-hide_banner", "-f", "lavfi", "-i", "anullsrc", "-t", "0.01",
+                 "-f", "audiotoolbox", "-list_devices", "true", "-"])
+        for line in p.stderr.splitlines():
+            m = re.search(r"\[(\d+)\]\s+" + re.escape(self.c["loopback_mic"]), line)
+            if m:
+                return int(m.group(1))
+        raise StepError("no loopback device")
+
+    def wait_for_idle(self, status) -> None:
+        need, deadline = float(self.c["idle_seconds"]), now() + float(self.c["idle_wait"])
+        while True:
+            idle = self.hid_idle()
+            if idle >= need:
+                return
+            if now() >= deadline:
+                raise UserActive()
+            status(f"WAIT {int(need - idle) + 1}")
+            time.sleep(min(need - idle, 2.0) + 0.1)
+
+    def transcribe(self, wav: Path, status, rec: dict) -> str:
+        self.wait_for_idle(status)
+        prev_front = self.front_bundle()
+        prev_dev, prev_name = self.mic()
+        baseline = self.last_ts()
+        device = self.loopback_index()
+        stop_flag = self.sink_app.parent / "sink.stop"
+
+        def guard() -> None:
+            if self.user_active():
+                raise UserActive()
+
+        try:
+            stop_flag.unlink(missing_ok=True)
+            guard()
+            run(["/usr/bin/open", str(self.sink_app)])
+            for _ in range(30):
+                if self.front_bundle() == self.sink_id:
+                    break
+                time.sleep(0.1)
+            else:
+                raise StepError("sink not front")
+            guard()
+            self.switch_mic(self.c["loopback_mic"])
+            time.sleep(0.6)
+            self.open_link("start-hands-free")
+            time.sleep(0.8)
+            guard()
+            play = subprocess.Popen(
+                [which(self.c["ffmpeg"]), "-hide_banner", "-loglevel", "error", "-re", "-i", str(wav),
+                 "-af", "apad=pad_dur=0.6", "-ac", "2", "-ar", "48000", "-f", "audiotoolbox",
+                 "-audio_device_index", str(device), "-"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            while play.poll() is None:
+                if self.user_active():
+                    play.terminate()
+                    play.wait(5)
+                    self.open_link("stop-hands-free")
+                    raise UserActive()
+                time.sleep(0.25)
+            rec["front_at_stop"] = self.front_bundle()
+            self.open_link("stop-hands-free")
+            deadline, raw_since = now() + 45, None
+            while now() < deadline:
+                row = self.new_row(baseline)
+                if row:
+                    rec["wispr_status"], rec["wispr_app"] = row[0], row[2]
+                if row and row[0] in ("empty", "no_audio", "error"):
+                    raise StepError(f"wispr {row[0]}")
+                if row and row[1].strip():
+                    if row[0] == "formatted" or (raw_since and now() - raw_since > 3):
+                        return row[1].strip()
+                    raw_since = raw_since or now()
+                time.sleep(0.2)
+            raise StepError("wispr no transcript")
+        finally:
+            self.restore_mic(prev_dev, prev_name)
+            stop_flag.touch()
+            for _ in range(10):
+                if not self.bundle_pid(self.sink_id):
+                    break
+                time.sleep(0.2)
+            else:
+                pid = self.bundle_pid(self.sink_id)
+                if pid:
+                    os.kill(pid, signal.SIGTERM)
+            if prev_front and prev_front != self.sink_id and self.front_bundle() != prev_front:
+                run(["/usr/bin/open", "-b", prev_front])
+            self.log_event({"event": "wispr_restore", "front_restored": self.front_bundle() == prev_front,
+                            "mic_restored": self.mic()[0] == prev_dev})
+
+
+SINK_JS = r"""
+ObjC.import('Cocoa');
+var stopPath = $.NSBundle.mainBundle.bundlePath.js.replace(/\/[^\/]+$/, '') + '/sink.stop';
+var started = Date.now();
+var win, tv;
+function run() {
+  win = $.NSWindow.alloc.initWithContentRectStyleMaskBackingDefer($.NSMakeRect(0, 0, 360, 110), 1, $.NSBackingStoreBuffered, false);
+  win.title = 'talkstick';
+  tv = $.NSTextView.alloc.initWithFrame($.NSMakeRect(0, 0, 360, 110));
+  win.contentView = tv;
+  win.center;
+  win.makeKeyAndOrderFront(null);
+  win.makeFirstResponder(tv);
+  $.NSApplication.sharedApplication.activateIgnoringOtherApps(true);
+}
+function idle() {
+  if ($.NSFileManager.defaultManager.fileExistsAtPath(stopPath) || Date.now() - started > 120000) {
+    $.NSApplication.sharedApplication.terminate(null);
+  }
+  return 0.3;
+}
+"""
+
+
+def build_sink(cfg: dict) -> None:
+    w = cfg["engine"]["wispr-macos"]
+    app = expand(w["sink_app"])
+    app.parent.mkdir(parents=True, exist_ok=True)
+    src = app.parent / "TalkstickSink.js"
+    src.write_text(SINK_JS)
+    steps = [
+        ["/usr/bin/osacompile", "-l", "JavaScript", "-s", "-o", str(app), str(src)],
+        ["/usr/bin/plutil", "-replace", "CFBundleIdentifier", "-string", w["sink_bundle_id"],
+         str(app / "Contents/Info.plist")],
+        ["/usr/bin/codesign", "--force", "--sign", "-", str(app)],
+    ]
+    for cmd in steps:
+        p = run(cmd)
+        if p.returncode != 0:
+            sys.exit(p.stderr)
+    with open(app / "Contents/Info.plist", "rb") as f:
+        print(f"built {app} ({plistlib.load(f)['CFBundleIdentifier']})")
+
+
+# Delivery
+
+def deliver_command(ccfg: dict, text: str, rec: dict, dry: bool, on_sent) -> str:
+    argv = [os.path.expandvars(os.path.expanduser(a)) for a in ccfg["argv"]]
+    if not argv:
+        raise StepError("delivery argv empty")
+    env = {**os.environ, "TALKSTICK_DEVICE": str(rec.get("device") or ""),
+           "TALKSTICK_UTTERANCE_ID": rec.get("utterance_id", ""), "TALKSTICK_DRY": "1" if dry else "0"}
+    p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, env=env)
+    timer = threading.Timer(float(ccfg.get("timeout", 660)), p.kill)
+    timer.start()
+    try:
+        p.stdin.write(text)
+        p.stdin.close()
+        err: list[str] = []
+        drain = threading.Thread(target=lambda: err.append(p.stderr.read()), daemon=True)
+        drain.start()
+        reply = []
+        for line in p.stdout:
+            if line.strip() == "@sent" and not reply:
+                on_sent()
+            else:
+                reply.append(line)
+        rc = p.wait()
+        drain.join(5)
+    finally:
+        timer.cancel()
+        p.stdout.close()
+        p.stderr.close()
+    rec["delivery_rc"] = rc
+    if rc == EXIT_OFFLINE:
+        raise Offline()
+    if rc != 0:
+        rec["delivery_stderr"] = "".join(err).strip()[-200:]
+        raise StepError(f"delivery exit {rc}")
+    on_sent()
+    return "".join(reply).strip()
+
+
+def parse_webhook_reply(content_type: str, body: bytes) -> str:
+    text = body.decode("utf-8", "replace")
+    if "json" in (content_type or ""):
+        try:
+            data = json.loads(text)
+        except ValueError:
+            return text.strip()
+        if isinstance(data, dict):
+            return str(data.get("reply") or "").strip()
+    return text.strip()
+
+
+def deliver_webhook(wcfg: dict, text: str, rec: dict, dry: bool) -> str:
+    if not wcfg.get("url"):
+        raise StepError("webhook url empty")
+    body = json.dumps({"text": text, "device": rec.get("device"), "utterance_id": rec.get("utterance_id"),
+                       "dry": dry}).encode()
+    req = urllib.request.Request(wcfg["url"], data=body, method="POST",
+                                 headers={"Content-Type": "application/json", **wcfg.get("headers", {})})
+    try:
+        with urllib.request.urlopen(req, timeout=float(wcfg.get("timeout", 660))) as r:
+            rec["webhook_status"] = r.status
+            return parse_webhook_reply(r.headers.get("Content-Type", ""), r.read())
+    except urllib.error.HTTPError as e:
+        rec["webhook_status"] = e.code
+        if e.code == 503:
+            raise Offline()
+        raise StepError(f"webhook {e.code}")
+    except (urllib.error.URLError, OSError) as e:
+        raise StepError(f"webhook {type(e).__name__}")
+
+
+# Advertising
+
+def advertise(name: str, stype: str, port: int) -> subprocess.Popen | None:
+    if shutil.which("dns-sd"):
+        cmd = ["dns-sd", "-R", name, stype, "local", str(port)]
+    elif shutil.which("avahi-publish"):
+        cmd = ["avahi-publish", "-s", name, stype, str(port)]
+    else:
+        return None
+    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def kill_stale_advertiser(state_file: Path) -> None:
+    try:
+        pid = json.loads(state_file.read_text()).get("advertiser_pid")
+    except (OSError, ValueError):
+        return
+    if pid and re.search(r"dns-sd|avahi", run(["ps", "-o", "comm=", "-p", str(pid)]).stdout):
+        os.kill(pid, signal.SIGTERM)
+
+
+# Commands
+
+def bench(d: Daemon, wav_path: str) -> None:
+    rec: dict = {"t_release": now(), "wav": wav_path, "bench": True, "device": "bench", "utterance_id": uuid.uuid4().hex}
+    t0 = rec["t_release"]
+    wav = Path(wav_path).expanduser().resolve()
+    out = lambda s: print(f"{now() - t0:6.2f}s  {s}", flush=True)
+    d.process(lambda: d.transcribe(wav, out, rec), out, rec)
+    print(json.dumps({k: v for k, v in rec.items() if k.startswith("d_") or k in ("engine", "outcome", "error")}))
+
+
+def fake_stick(cfg: dict, mode: str, wav_path: str | None, target: str = "127.0.0.1") -> None:
+    """mode: utterance (stream wav_path then E), status (S), ping (P). Prints each line with seconds since the
+    last frame was sent; a ping reads until the daemon closes."""
+    host, _, port = target.partition(":")
+    pcm = b""
+    if mode == "utterance":
+        with wave.open(wav_path, "rb") as w:
+            if (w.getnchannels(), w.getsampwidth(), w.getframerate()) != (1, 2, RATE):
+                sys.exit("fake-stick needs a 16 kHz mono s16 WAV")
+            pcm = w.readframes(w.getnframes())
+    s = socket.create_connection((host, int(port or cfg["port"])), timeout=5)
+    s.settimeout(660)
+    s.sendall(b"M5R1 fakestick 100 fake-1\n")
+    for i in range(0, len(pcm), 4096):
+        chunk = pcm[i:i + 4096]
+        s.sendall(b"A" + struct.pack("<H", len(chunk)) + chunk)
+    s.sendall({"utterance": b"E", "status": b"S", "ping": b"P"}[mode] + b"\x00\x00")
+    t_end = now()
+    for raw in s.makefile("rb"):
+        line = raw.decode(errors="replace").strip()
+        print(f"{now() - t_end:6.2f}s  {line}", flush=True)
+        if mode != "ping" and line.split()[:1] in (["REPLIED"], ["OFFLINE"], ["ERR"]):
+            break
+    s.close()
+
+
+def status_cmd(d: Daemon) -> None:
+    try:
+        st = json.loads((d.state / "state.json").read_text())
+    except (OSError, ValueError):
+        st = {}
+    port = st.get("port", d.cfg["port"])
+    up = run(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"]).stdout.strip()
+    print(f"daemon: {'up' if up else 'down'} port {port} pid {st.get('pid')} engine {st.get('engine')} "
+          f"delivery {st.get('delivery')} dry {st.get('dry')}")
+    rows = []
+    try:
+        rows = [r for r in map(json.loads, d.events.read_text().splitlines()) if r.get("event") == "utterance"]
+    except (OSError, ValueError):
+        pass
+    for r in rows[-5:]:
+        t = " ".join(f"{k[2:]}={r[k]}" for k in ("d_transcript", "d_sent", "d_reply", "d_done") if k in r)
+        print(f"  {r['ts']} {r.get('engine')}/{r.get('delivery')} {r.get('outcome')} audio={r.get('audio_s')}s {t}")
+
+
+def main(argv: list[str]) -> None:
+    cfg = load_config()
+    if "--dry" in argv:
+        cfg["dry"] = True
+        argv = [a for a in argv if a != "--dry"]
+    d = Daemon(cfg)
+    cmd = argv[1] if len(argv) > 1 else "serve"
+    if cmd == "serve":
+        d.serve()
+    elif cmd == "bench" and len(argv) == 3:
+        bench(d, argv[2])
+    elif cmd == "fake-stick" and len(argv) >= 3:
+        args = argv[2:]
+        mode = "status" if "--status" in args else "ping" if "--ping" in args else "utterance"
+        args = [a for a in args if a not in ("--status", "--ping")]
+        if mode == "utterance" and not 1 <= len(args) <= 2:
+            sys.exit(__doc__)
+        if mode != "utterance" and len(args) > 1:
+            sys.exit(__doc__)
+        wav = args.pop(0) if mode == "utterance" else None
+        fake_stick(cfg, mode, wav, *args)
+    elif cmd == "status":
+        status_cmd(d)
+    elif cmd == "build-sink":
+        build_sink(cfg)
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

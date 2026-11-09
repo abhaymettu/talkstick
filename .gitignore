@@ -1,0 +1,7 @@
+build/
+*.bin
+*.elf
+secrets.h
+firmware/*/secrets.h
+__pycache__/
+*.wav
