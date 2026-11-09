@@ -13,5 +13,5 @@ image="${TALKSTICK_BUILD_DIR:-$HOME/.cache/talkstick/build}/talkstick.ino.merged
 [ -n "$port" ] || { echo "no /dev/cu.usbmodem* port found, set PORT" >&2; exit 1; }
 [ -f "$image" ] || { echo "no image at $image, run build.sh first" >&2; exit 1; }
 esptool --chip esp32s3 --port "$port" --baud 921600 \
-  --before default-reset --after hard-reset \
+  --before default-reset --after watchdog-reset \
   write-flash 0 "$image"

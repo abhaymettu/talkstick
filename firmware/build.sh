@@ -9,12 +9,16 @@
 # both contain the WiFi password, so they go to private directories outside the repo:
 #   TALKSTICK_GEN_DIR    default ~/.config/talkstick/gen
 #   TALKSTICK_BUILD_DIR  default ~/.cache/talkstick/build
+# The over-the-air update key (64 hex characters, the daemon's ota_key_file) is embedded too. It is created
+# with mode 600 if missing:
+#   TALKSTICK_OTA_KEY_FILE  default ~/.config/talkstick/ota.key
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
-fqbn="${FQBN:-m5stack:esp32:m5stack_sticks3}"
+fqbn="${FQBN:-m5stack:esp32:m5stack_sticks3:PartitionScheme=default_8MB}"
 gen="${TALKSTICK_GEN_DIR:-$HOME/.config/talkstick/gen}"
 out="${TALKSTICK_BUILD_DIR:-$HOME/.cache/talkstick/build}"
+export TALKSTICK_OTA_KEY_FILE="${TALKSTICK_OTA_KEY_FILE:-$HOME/.config/talkstick/ota.key}"
 [ "$#" -gt 0 ] || set -- "$HOME/.config/talkstick/firmware.env"
 
 umask 077
@@ -22,7 +26,7 @@ mkdir -p "$gen" "$out"
 chmod 700 "$gen" "$out"
 
 /usr/bin/python3 -I - "$gen/talkstick_config.h" "$@" <<'PY'
-import os, sys
+import os, re, secrets, sys
 
 header_path, env_paths = sys.argv[1], sys.argv[2:]
 aliases = {"M5_WIFI_SSID": "TALKSTICK_WIFI_SSID", "M5_WIFI_PASS": "TALKSTICK_WIFI_PASS"}
@@ -51,6 +55,19 @@ if missing:
 service = values["TALKSTICK_SERVICE"].strip().removeprefix("_").removesuffix("._tcp")
 port = int(values["TALKSTICK_PORT"])
 
+key_path = os.path.expanduser(os.environ["TALKSTICK_OTA_KEY_FILE"])
+if not os.path.exists(key_path):
+    os.makedirs(os.path.dirname(key_path) or ".", mode=0o700, exist_ok=True)
+    fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(secrets.token_hex(32) + "\n")
+    print("ota key created")
+with open(key_path) as f:
+    key_hex = f.read().strip()
+if not re.fullmatch(r"[0-9a-fA-F]{64}", key_hex):
+    sys.exit("ota key file must hold 64 hex characters")
+ota_key = "{" + ", ".join("0x" + key_hex[i:i + 2] for i in range(0, 64, 2)) + "}"
+
 def c_string(s):
     return '"' + "".join("\\%03o" % b for b in s.encode()) + '"'
 
@@ -61,6 +78,7 @@ body = (
     "#define TS_SERVICE " + c_string(service) + "\n"
     "#define TS_PORT " + str(port) + "\n"
     "#define TS_HOST_FALLBACK " + c_string(values["TALKSTICK_HOST_FALLBACK"]) + "\n"
+    "#define TS_OTA_KEY " + ota_key + "\n"
 )
 fd = os.open(header_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 with os.fdopen(fd, "w") as f:
@@ -69,10 +87,12 @@ os.chmod(header_path, 0o600)
 print(f"config header written (service _{service}._tcp, port {port})")
 PY
 
-arduino-cli compile \
+nice -n 10 arduino-cli compile \
+  --jobs 2 \
+  --warnings "${TALKSTICK_WARNINGS:-default}" \
   --fqbn "$fqbn" \
   --build-path "$out" \
   --build-property "compiler.cpp.extra_flags=-I$gen" \
   "$here/talkstick"
 
-ls -l "$out"/talkstick.ino.merged.bin
+ls -l "$out"/talkstick.ino.bin "$out"/talkstick.ino.merged.bin
