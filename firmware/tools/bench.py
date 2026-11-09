@@ -18,6 +18,16 @@ import wave
 import serial
 
 
+
+def open_port(port, timeout):
+    """Open the stick's USB serial without resetting it. On the ESP32-S3 USB-Serial/JTAG, RTS asserted while DTR is
+    not holds the chip in reset, and pyserial's defaults leave it frozen, so set DTR on and RTS off before opening."""
+    s = serial.Serial()
+    s.port, s.baudrate, s.timeout = port, 115200, timeout
+    s.dtr, s.rts = True, False
+    s.open()
+    return s
+
 def default_port():
     ports = sorted(glob.glob("/dev/cu.usbmodem*"))
     if not ports:
@@ -60,7 +70,7 @@ def main():
     ap.add_argument("--listen", type=float, default=10)
     args = ap.parse_args()
 
-    with serial.Serial(args.port or default_port(), 115200, timeout=0.2) as s:
+    with open_port(args.port or default_port(), 0.2) as s:
         if args.action == "listen":
             listen(s, float(args.arg))
         elif args.action == "cmd":

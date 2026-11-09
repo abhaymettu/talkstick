@@ -465,7 +465,51 @@ static bool mac_ok = false;
 static uint32_t last_ping_ms = 0;
 static bool pinged_this_wake = false;
 
+// Logs why a join failed (201 no AP with that name, 15 or 204 wrong password, 2 or 202 auth rejected), never the
+// network name or password.
+static void on_wifi_event(WiFiEvent_t event, WiFiEventInfo_t info) {
+  if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    Serial.printf("[%lu] wifi disconnected reason=%u\n", millis(), info.wifi_sta_disconnected.reason);
+  }
+}
+
+// Reports whether the configured network is visible, with channel, signal and security, and how many networks
+// are visible in total. Names are compared on the stick and never printed.
+static void wifi_start();
+
+static void wifi_scan_report() {
+  WiFi.disconnect(false);
+  delay(200);
+  int n = WiFi.scanNetworks(false, true);
+  String want = String(TS_WIFI_SSID);
+  String want_lc = want;
+  want_lc.toLowerCase();
+  int exact = 0;
+  for (int i = 0; i < n; i++) {
+    String got = WiFi.SSID(i);
+    String got_lc = got;
+    got_lc.toLowerCase();
+    const char* kind = got == want ? "exact" : got_lc == want_lc ? "same-ignoring-case"
+                       : (got_lc.indexOf(want_lc) >= 0 || (got_lc.length() && want_lc.indexOf(got_lc) >= 0)) ? "contains"
+                       : nullptr;
+    if (got == want) exact++;
+    if (kind) {
+      Serial.printf("[%lu] scan: %s match ch=%ld rssi=%ld auth=%d len=%u\n", millis(), kind, (long)WiFi.channel(i),
+                    (long)WiFi.RSSI(i), (int)WiFi.encryptionType(i), got.length());
+    }
+  }
+  Serial.printf("[%lu] scan: %d networks visible on 2.4 GHz, exact matches %d, configured name length %u\n", millis(),
+                n, exact, want.length());
+  WiFi.scanDelete();
+  wifi_start();
+}
+
 static void wifi_start() {
+  static bool handler = false;
+  if (!handler) {
+    WiFi.onEvent(on_wifi_event);
+    handler = true;
+  }
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
@@ -532,7 +576,15 @@ static bool discover_and_connect() {
   int n = MDNS.queryService(TS_SERVICE, "tcp");
   Serial.printf("[%lu] mdns _%s._tcp found %d (%lu ms)\n", millis(), TS_SERVICE, n, millis() - t0);
   for (int i = 0; i < n; i++) {
-    if (try_connect(MDNS.address(i), MDNS.port(i), "mdns")) return mac_ok = true;
+    IPAddress ip = MDNS.address(i);
+    if (!(uint32_t)ip && MDNS.hostname(i).length()) {
+      // Some responders (macOS dns-sd -R) answer the service without an A record; resolve its host name instead.
+      String h = MDNS.hostname(i);
+      if (h.endsWith(".local")) h.remove(h.length() - 6);
+      ip = MDNS.queryHost(h.c_str(), 2000);
+      Serial.printf("[%lu] mdns service host %s -> %s\n", millis(), h.c_str(), ip.toString().c_str());
+    }
+    if ((uint32_t)ip && try_connect(ip, MDNS.port(i), "mdns")) return mac_ok = true;
   }
   String host = TS_HOST_FALLBACK;
   if (host.endsWith(".local")) host.remove(host.length() - 6);
@@ -1032,6 +1084,8 @@ static void serial_step() {
       Serial.printf("[%lu] sound %s\n", millis(), rtc_sound_on ? "on" : "off");
     } else if (cmd == "ping") {
       ping_mac();
+    } else if (cmd == "scan") {
+      wifi_scan_report();
     } else if (cmd == "sleep") {
       enter_deep_sleep("serial");
     } else if (cmd == "forget") {

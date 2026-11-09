@@ -15,6 +15,16 @@ import zlib
 import serial
 
 
+
+def open_port(port, timeout):
+    """Open the stick's USB serial without resetting it. On the ESP32-S3 USB-Serial/JTAG, RTS asserted while DTR is
+    not holds the chip in reset, and pyserial's defaults leave it frozen, so set DTR on and RTS off before opening."""
+    s = serial.Serial()
+    s.port, s.baudrate, s.timeout = port, 115200, timeout
+    s.dtr, s.rts = True, False
+    s.open()
+    return s
+
 def default_port():
     ports = sorted(glob.glob("/dev/cu.usbmodem*"))
     if not ports:
@@ -23,7 +33,7 @@ def default_port():
 
 
 def grab(port):
-    with serial.Serial(port, 115200, timeout=0.5) as s:
+    with open_port(port, 0.5) as s:
         s.reset_input_buffer()
         s.write(b"shot\n")
         deadline = time.time() + 5
