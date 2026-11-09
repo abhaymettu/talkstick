@@ -20,7 +20,7 @@
 static const uint8_t OTA_KEY[32] = TS_OTA_KEY;
 #endif
 
-static constexpr const char* FW_VERSION = "talkstick-0.3.2";
+static constexpr const char* FW_VERSION = "talkstick-0.3.4";
 
 static constexpr gpio_num_t PTT_PIN = GPIO_NUM_11;
 static constexpr int PRESSED_LEVEL = 0;
@@ -663,13 +663,13 @@ static Screen scr_updating(const char* version, int pct, bool restarting) {
   return sc;
 }
 
-static void draw_paw(int cx, int cy, int s, uint16_t color) {
-  canvas.fillEllipse(cx, cy + s * 35 / 100, s * 48 / 100, s * 36 / 100, color);
-  int r = s * 18 / 100 + 1;
-  canvas.fillCircle(cx - s * 58 / 100, cy - s * 8 / 100, r, color);
-  canvas.fillCircle(cx - s * 22 / 100, cy - s * 45 / 100, r, color);
-  canvas.fillCircle(cx + s * 22 / 100, cy - s * 45 / 100, r, color);
-  canvas.fillCircle(cx + s * 58 / 100, cy - s * 8 / 100, r, color);
+// A 16 px paw: one pad and four separate toes, so it still reads as a paw at this size.
+static void draw_paw(int cx, int cy, uint16_t color) {
+  canvas.fillSmoothRoundRect(cx - 5, cy + 0, 11, 8, 4, color);
+  canvas.fillSmoothCircle(cx - 7, cy - 2, 2, color);
+  canvas.fillSmoothCircle(cx - 3, cy - 6, 2, color);
+  canvas.fillSmoothCircle(cx + 3, cy - 6, 2, color);
+  canvas.fillSmoothCircle(cx + 7, cy - 2, 2, color);
 }
 
 static String drawn_key;
@@ -688,7 +688,7 @@ static void paint(const Screen& sc) {
     canvas.drawWideLine(M + 1, 26, M + 7, 32, 1.6f, C_GREEN);
     canvas.drawWideLine(M + 7, 32, M + 17, 18, 1.6f, C_GREEN);
   }
-  if (sc.paw) draw_paw(M + 6, 16, 10, C_GREEN);
+  if (sc.paw) draw_paw(M + 7, 16, C_GREEN);
   if (sc.bars) {
     int x0 = (W - (BARS * (BAR_W + BAR_GAP) - BAR_GAP)) / 2;
     for (int i = 0; i < BARS; i++) {
@@ -895,8 +895,11 @@ static bool watch_try(WiFiClient& c, IPAddress ip, uint16_t port, const char* vi
 }
 
 // The cached host, then the Bonjour service, then the fallback host name.
-static bool watch_connect(WiFiClient& c) {
+// With a cached host, only it is tried until it has refused for 10 s (20 tries): a daemon restart then reconnects
+// within half a second instead of waiting out a 3 s Bonjour search on every attempt.
+static bool watch_connect(WiFiClient& c, bool search) {
   if (rtc_host_ip && watch_try(c, IPAddress(rtc_host_ip), rtc_host_port, "cached", CACHED_CONNECT_MS)) return true;
+  if (rtc_host_ip && !search) return false;
   if (!mdns_started) {
     char name[24];
     snprintf(name, sizeof name, "talkstick-%06lx", (unsigned long)(ESP.getEfuseMac() >> 24) & 0xffffff);
@@ -1180,7 +1183,7 @@ static void net_task(void*) {
     }
 
     if (wifi_up && !watch_on && (int32_t)(now - next_try) >= 0) {
-      if (watch_connect(watch)) {
+      if (watch_connect(watch, !rtc_host_ip || fails % 20 == 19)) {
         watch_on = true;
         got_time = false;
         last_line = millis();
@@ -1191,7 +1194,7 @@ static void net_task(void*) {
         if (n) send_frame(watch, 'L', logbuf, n);
       } else {
         fails++;
-        next_try = millis() + (fails >= 3 ? 3000 : fails * 1000);
+        next_try = millis() + (rtc_host_ip && fails % 20 != 0 ? 500 : 3000);
       }
     }
 
@@ -1749,7 +1752,7 @@ static bool make_demo(const String& name, Screen& out) {
   else if (name == "notheard") out = scr_problem("Didn't catch that", "Nothing was heard", "Hold A a little longer");
   else if (name == "offline") out = scr_problem("Driver offline", "No live driver thread", "Nothing was posted");
   else if (name == "cancelled") out = scr_cancelled();
-  else if (name == "updating") out = scr_updating("talkstick-0.3.2", 42, false);
+  else if (name == "updating") out = scr_updating("talkstick-0.3.4", 42, false);
   else return false;
   return true;
 }
