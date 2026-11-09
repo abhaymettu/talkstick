@@ -40,7 +40,7 @@
     "_types": "print (stdout), command, webhook",
     "type": "print",
     "command": {
-      "_contract": "transcript on stdin; print a line @sent once delivered (stick shows SENT); everything else printed is the reply; exit 0 = REPLIED, exit 3 = target offline (OFFLINE), other nonzero = ERR. Env: TALKSTICK_DEVICE, TALKSTICK_UTTERANCE_ID, TALKSTICK_DRY (1 = do not deliver)",
+      "_contract": "transcript on stdin; print a line @sent once delivered (stick shows SENT); after @sent and before the reply, the status lines @busy (the target is running a turn that is not this message's) and @running (this message's turn is running) set the stick's queue and are never reply text; everything else printed is the reply; exit 0 = REPLIED, exit 3 = target offline (OFFLINE), other nonzero = ERR. Env: TALKSTICK_DEVICE, TALKSTICK_UTTERANCE_ID, TALKSTICK_DRY (1 = do not deliver)",
       "argv": ["python3", "/path/to/my-deliver.py"],
       "timeout": 660
     },
@@ -63,5 +63,8 @@
 
   "status_prompt": null,
   "_status_prompt": "text sent through delivery when the stick sends S (a short press), e.g. \"status: one line on what is running and what needs me\"; unset = the stick gets ERR",
-  "stick_reply_chars": 600
+  "stick_reply_chars": 600,
+
+  "ota_key_file": "~/.config/talkstick/ota.key",
+  "_ota_key_file": "64 hex characters (32 bytes) that sign over-the-air update offers; the firmware build embeds the same key. Without it `talkstick ota` refuses and the daemon never offers an update"
 }

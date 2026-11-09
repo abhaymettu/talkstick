@@ -96,7 +96,9 @@ without the stick:
 say -o hi.aiff "hello from the stick" && ffmpeg -i hi.aiff -ar 16000 -ac 1 hi.wav   # any 16 kHz mono WAV
 daemon/talkstick fake-stick hi.wav localhost      # acts as the stick, prints each status line with timings
 daemon/talkstick bench hi.wav                     # transcribe and deliver once, no network
-daemon/talkstick status                           # is it up, which engine, last five timings
+daemon/talkstick fake-stick --watch localhost     # acts as the stick's watch connection: queue, answers, offers
+daemon/talkstick status                           # is it up, last five timings, queue and in-flight items, staged update
+daemon/talkstick ota ~/.cache/talkstick/build/talkstick.ino.bin   # update the stick over WiFi (needs ota_key_file)
 ```
 
 To keep it running on macOS, put `daemon/talkstick` somewhere stable and load a launchd agent; a template is in
@@ -108,7 +110,9 @@ connection may ask the macOS firewall for permission for the Python that runs it
 Delivery is a command or a webhook, so anything you can script works.
 
 **A command.** The transcript arrives on stdin. Print `@sent` once it is delivered (the stick shows *Sent*), then
-print the reply. Exit 3 means the target is offline.
+print the reply. Exit 3 means the target is offline. Optionally, between `@sent` and the reply, print `@busy` while
+the target is busy with something else and `@running` once it works on this message; the stick shows its place in
+the queue.
 
 ```json
 "delivery": {"type": "command", "command": {"argv": ["/path/to/ask-my-agent.sh"], "timeout": 600}}
@@ -147,6 +151,7 @@ Examples:
 | `offline_message` | null | sent through `on_reply` when the target is offline |
 | `state_dir`, `keep_utterances` | `~/.local/state/talkstick`, 20 | event log (`events.jsonl` with per-step timings), last reply, recent WAVs |
 | `dry` | false | `--dry` or `TALKSTICK_DRY=1`: delivery commands get `TALKSTICK_DRY=1` and must not deliver |
+| `ota_key_file` | `~/.config/talkstick/ota.key` | 64 hex characters that sign update offers; the firmware build embeds the same key |
 
 The wire protocol (M5R1) is small enough to implement on another device: [docs/protocol.md](docs/protocol.md).
 
@@ -158,7 +163,8 @@ The wire protocol (M5R1) is small enough to implement on another device: [docs/p
 - **Battery.** 250 mAh. Deep sleep between uses; WiFi is on only while talking and waiting for the reply (up to 11
   minutes). Battery life per charge has not been measured yet.
 - **Range.** Ordinary 2.4 GHz WiFi; the stick and the computer must be on the same network.
-- **One talker.** The daemon handles one utterance at a time; a second press waits until the first reply is in.
+- **One target, in order.** Utterances are delivered one after another in press order, each as soon as the one
+  before it is delivered; replies come back on their own and are paired with what you said.
 - **Wispr Flow engine** (`wispr-macos`) is experimental: it drives Wispr Flow's deep links and plays audio into a
   BlackHole virtual mic, needs the user idle while it runs, and can paste into the focused app. Use whisper unless
   you know you want it.

@@ -6,7 +6,7 @@ Press the stick, say something, and it lands as a message in a [T3 Code](https:/
 
 1. It reads the transcript on stdin.
 2. It checks the thread is live, meaning not settled and not archived. If it is not, it exits 3 and the stick shows OFFLINE.
-3. It sends the transcript with `t3 thread send <id> -` and prints `@sent`, so the stick shows SENT.
+3. It sends the transcript with `t3 thread send <id> -` and prints `@sent`, so the stick shows SENT. It then prints `@busy` while the thread runs some other turn and `@running` once its own message's turn runs, so the stick can show its place in the queue.
 4. It polls `t3 thread show --json` every 3 s, for up to 10 minutes. It waits for the run that its own message started, then prints that run's last assistant message. A busy thread queues the message as its next turn. Matching on the run, not on "any new assistant text", keeps an unrelated reply from being returned.
 
 Nothing else from the thread transcript is printed or logged.

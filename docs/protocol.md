@@ -64,12 +64,21 @@ words are delivered, so it can be pressed again while earlier replies are still 
 | `W` | none | watch: keep this connection open and push queue state, answers and update offers on it |
 | `K` | answer id (ASCII) | ack: the stick has stored that answer; the daemon stops offering it |
 | `F` | version (ASCII) | fetch the staged firmware image with that version |
+| `L` | log text (ASCII, at most 1024 bytes) | the stick's recent diagnostic lines; the daemon writes them to its event log |
+
+`E` and `S` may carry a payload: the stick's own id for the utterance, 8 lowercase hex characters. The stick keeps
+the recording and resends the whole utterance with the same id when the connection fails before it sees `SENT`.
+The daemon uses that id as the utterance's `ID` and in its `ANSWER`, and remembers the last 64 delivered ids per
+device across restarts. A resent id that was already delivered gets `RECV`, `ID <id>`, `SENT <said>` and is not
+delivered again; its `ANSWER` comes on the watch connection as usual. A resent id still being received or
+transcribed gets `RECV`, `ID <id>`, `ERR busy`, and the stick retries a few seconds later. Without a payload the
+daemon picks the id.
 
 ### More lines on an utterance or status connection
 
 | Line | When |
 |---|---|
-| `ID <id>` | right after `RECV`; `<id>` is 8 lowercase hex characters naming this utterance |
+| `ID <id>` | right after `RECV`; `<id>` is 8 lowercase hex characters naming this utterance (the stick's own, if `E` or `S` carried one) |
 
 `SENT` means the words are in the delivery target. A watching stick closes the socket after `SENT`, `OFFLINE` or
 `ERR`. The daemon goes on waiting for the reply, and writes it to this socket only if the stick kept it open.

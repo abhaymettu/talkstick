@@ -1,27 +1,41 @@
 #!/usr/bin/env python3
 """talkstick: push-to-talk from an M5StickS3 (or anything speaking M5R1) to a command, a webhook or stdout.
 
-Usage: talkstick [serve | bench WAV | fake-stick (WAV | --status | --ping) [HOST[:PORT]] | status | build-sink] [--dry]
+Usage: talkstick serve [--dry]
+       talkstick bench WAV
+       talkstick fake-stick (WAV | --status | --ping | --watch) [HOST[:PORT]]
+       talkstick status
+       talkstick ota IMAGE.bin [--version V] [--timeout S]
+       talkstick build-sink
 Config: JSON at $TALKSTICK_CONFIG, else ~/.config/talkstick/config.json. See config.example.json.
 
-Wire protocol M5R1 (one TCP connection per utterance, stick to daemon):
+Wire protocol M5R1 (docs/protocol.md; one TCP connection per utterance, ping, watch or fetch):
   stick sends  "M5R1 <device-id> <battery%> <fw-version>\\n", then frames of
                1 byte type + 2 bytes little-endian length + payload:
                A = audio (s16le PCM, 16 kHz, mono, up to 4096 bytes), E = end of utterance, C = cancel,
-               S = status request (runs config status_prompt through delivery instead of audio),
-               P = ping (daemon answers TIME and LAST, then closes).
-  daemon sends UTF-8 lines: TIME <epoch> <utc-offset-s> (right after HELLO), RECV, WAIT <s>,
+               S = status request (runs config status_prompt through delivery instead of audio); E and S may
+               carry the stick's 8-hex utterance id, and a resent id is never delivered twice,
+               P = ping (daemon answers TIME and LAST, then closes), W = watch (connection stays open),
+               K <id> = ack an ANSWER, F <version> = fetch the staged firmware image,
+               L <text> = the stick's diagnostic lines, written to the event log.
+  daemon sends UTF-8 lines: TIME <epoch> <utc-offset-s> (right after HELLO), RECV, ID <8 hex>, WAIT <s>,
                SENT [first 40 chars], REPLY <text> (just before REPLIED), REPLIED, OFFLINE, ERR <reason>,
                LAST <text> (on ping, the last reply). REPLY and LAST text: at most stick_reply_chars (600)
                characters, newlines written as the two characters \\n.
+  on a watch   TIME every 5 s, QUEUE <waiting> <busy> <ahead>, ANSWER <id> <outcome> <said>\\t<text>,
+               OTA <size> <sha256> <mac> <version>. On F: IMAGE <size> <sha256>\\n + the raw image, or ERR no image.
+  Utterances are delivered in the order their E or S arrived, and the next one is delivered without waiting for
+  the previous reply.
 
 Delivery contract
   print    The transcript is printed to the daemon's stdout. The stick sees SENT, then REPLIED.
   command  argv runs with the transcript on stdin (stdin is then closed). Env: TALKSTICK_DEVICE,
            TALKSTICK_UTTERANCE_ID, TALKSTICK_DRY ("1" in dry mode; the command must then not deliver).
            A stdout line "@sent" means the text was delivered: the stick sees SENT right away.
-           Everything else on stdout is the reply. Exit 0 = REPLIED, exit 3 = target offline (OFFLINE),
-           any other exit = ERR. No "@sent" before exit 0 means SENT is sent at exit.
+           After "@sent" and before the reply, the status lines "@busy" (the target is running a turn that is
+           not this message's) and "@running" (this message's turn is running) set the stick's QUEUE; they are
+           never reply text. Everything else on stdout is the reply. Exit 0 = REPLIED, exit 3 = target offline
+           (OFFLINE), any other exit = ERR. No "@sent" before exit 0 means SENT is sent at exit.
   webhook  POST url with JSON {"text", "device", "utterance_id", "dry"}. A JSON body {"reply": "..."}
            or a plain-text body is the reply. 503 = offline. Other non-2xx = ERR.
   on_reply Optional argv run with the reply on stdin, trimmed to reply_max_chars plus reply_more_suffix.
@@ -29,6 +43,8 @@ Delivery contract
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import plistlib
@@ -55,6 +71,13 @@ MAX_AUDIO_BYTES = RATE * 2 * 125
 KEEP_UTTERANCES = 20
 EXIT_OFFLINE = 3
 STICK_REPLY_CHARS = 600
+KEEP_ANSWERS = 8
+KEEP_DELIVERED = 64
+WATCH_TICK = 1.0
+HEARTBEAT_EVERY = 5
+STICK_LOG_BYTES = 1024
+OTA_MAX_BYTES = 3342336
+OTA_VERSION_RE = rb"talkstick-\d+\.\d+\.\d+[0-9A-Za-z.-]*"
 
 DEFAULTS: dict = {
     "port": 47820,
@@ -92,6 +115,7 @@ DEFAULTS: dict = {
     "on_reply_timeout": 90,
     "status_prompt": None,
     "stick_reply_chars": STICK_REPLY_CHARS,
+    "ota_key_file": "~/.config/talkstick/ota.key",
 }
 
 
@@ -143,15 +167,85 @@ class Offline(Exception):
     """The delivery target is down; the stick shows OFFLINE."""
 
 
+class Turnstile:
+    """Lets ticket holders through one at a time, in the order the tickets were taken. A ticket released before
+    its turn (an early failure) is skipped when its turn comes."""
+
+    def __init__(self):
+        self.cond = threading.Condition()
+        self.issued = 0
+        self.serving = 0
+        self.done: set[int] = set()
+
+    def take(self) -> int:
+        with self.cond:
+            self.issued += 1
+            return self.issued - 1
+
+    def wait(self, ticket: int) -> None:
+        with self.cond:
+            self.cond.wait_for(lambda: self.serving >= ticket)
+
+    def release(self, ticket: int) -> None:
+        with self.cond:
+            if ticket < self.serving or ticket in self.done:
+                return
+            self.done.add(ticket)
+            while self.serving in self.done:
+                self.done.discard(self.serving)
+                self.serving += 1
+            self.cond.notify_all()
+
+
+class Item:
+    """One utterance from RECV to its answer. waiting: SENT and no answer yet. report: the delivery's last status
+    line about the target, "busy" or "running"."""
+
+    def __init__(self, uid: str, device: str):
+        self.id, self.device = uid, device
+        self.t_recv = now()
+        self.said = ""
+        self.waiting = False
+        self.report: str | None = None
+
+
+class Watcher:
+    def __init__(self, device: str, fw: str | None, send):
+        self.device, self.fw, self.send = device, fw, send
+
+
+def flat(text: str) -> str:
+    return re.sub(r"[\t\r\n]", " ", text)
+
+
+def answer_line(a: dict) -> str:
+    return f"ANSWER {a['id']} {a['outcome']} {a['said']}\t{a['text']}"
+
+
+def write_atomic(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+
+
 class Daemon:
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.state = expand(cfg["state_dir"])
         self.events = self.state / "events.jsonl"
         self.events_lock = threading.Lock()
-        self.work_lock = threading.Lock()
         self.reply_lock = threading.Lock()
         self.reply_threads: list = []
+        self.turn = Turnstile()
+        self.lock = threading.RLock()
+        self.items: dict[str, dict[str, Item]] = {}
+        self.watchers: dict[str, list[Watcher]] = {}
+        self.queue_sent: dict[str, str] = {}
+        self.answers: dict[str, list[dict]] = {}
+        self.delivered: dict[str, list[list[str]]] = {}
+        self.load_answers()
+        self.ota = load_manifest(self.state)
 
     @property
     def dry(self) -> bool:
@@ -186,27 +280,220 @@ class Daemon:
 
     # Delivery
 
-    def deliver(self, text: str, status, rec: dict) -> str:
+    def deliver(self, text: str, rec: dict, sent, report) -> str:
+        """sent() runs once the text is in the target; report("busy" | "running") on the target's state."""
         d = self.cfg["delivery"]
         kind = d["type"]
         rec["delivery"] = kind
         if kind == "print":
             print(f"[talkstick] {rec.get('device')}: {text}", flush=True)
-            status(f"SENT {text[:40]}")
-            rec["t_sent"] = now()
+            sent()
             return ""
         if kind == "command":
-            return deliver_command(d["command"], text, rec, self.dry, lambda: self._sent(text, status, rec))
+            return deliver_command(d["command"], text, rec, self.dry, sent, report)
         if kind == "webhook":
             reply = deliver_webhook(d["webhook"], text, rec, self.dry)
-            self._sent(text, status, rec)
+            sent()
             return reply
         raise StepError(f"delivery {kind}?")
 
-    def _sent(self, text: str, status, rec: dict) -> None:
-        if "t_sent" not in rec:
-            rec["t_sent"] = now()
-            status(f"SENT {text[:40]}")
+    # Queue and answers, per device. Everything here runs under self.lock, so watchers see lines in order.
+
+    @property
+    def answers_file(self) -> Path:
+        return self.state / "answers.json"
+
+    def load_answers(self) -> None:
+        """answers.json: {"answers": {device: [unacked answer]}, "delivered": {device: [[id, said]]}}."""
+        try:
+            data = json.loads(self.answers_file.read_text())
+        except (OSError, ValueError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        self.answers = data.get("answers") or {}
+        self.delivered = data.get("delivered") or {}
+
+    def save_answers(self) -> None:
+        write_atomic(self.answers_file, json.dumps({"answers": self.answers, "delivered": self.delivered}).encode())
+
+    def duplicate(self, device: str, uid: str) -> tuple[str, str] | None:
+        """("delivered", said) or ("in_progress", "") for an id this device sent before, else None."""
+        for did, said in self.delivered.get(device, []):
+            if did == uid:
+                return "delivered", said
+        return ("in_progress", "") if uid in self.items.get(device, {}) else None
+
+    def queue_line(self, device: str) -> str:
+        waiting = [i for i in self.items.get(device, {}).values() if i.waiting]
+        reports = {i.report for i in waiting}
+        busy = int("busy" in reports and "running" not in reports)
+        return f"QUEUE {len(waiting)} {busy} {max(len(waiting) - 1, 0) + busy}"
+
+    def push(self, device: str, line: str) -> None:
+        with self.lock:
+            for w in list(self.watchers.get(device, [])):
+                if w.send(line) is False:
+                    self.unwatch(w)
+
+    @property
+    def queue_file(self) -> Path:
+        return self.state / "queue.json"
+
+    def items_changed(self, device: str) -> None:
+        """Write the in-flight items for `talkstick status`, and push QUEUE if it changed."""
+        with self.lock:
+            write_atomic(self.queue_file, json.dumps({
+                d: {"queue": [int(n) for n in self.queue_line(d).split()[1:]],
+                    "items": [{"id": i.id, "state": i.report or ("waiting" if i.waiting else "sending"),
+                               "since": i.t_recv} for i in items.values()]}
+                for d, items in self.items.items() if items}).encode())
+            line = self.queue_line(device)
+            if self.queue_sent.get(device) != line:
+                self.queue_sent[device] = line
+                self.push(device, line)
+
+    def open_item(self, rec: dict) -> Item:
+        item = Item(rec["utterance_id"][:8], rec.get("device") or "")
+        with self.lock:
+            self.items.setdefault(item.device, {})[item.id] = item
+            self.items_changed(item.device)
+        return item
+
+    def mark_sent(self, item: Item) -> None:
+        with self.lock:
+            item.waiting = True
+            self.delivered[item.device] = (self.delivered.get(item.device, []) + [[item.id, item.said]])[-KEEP_DELIVERED:]
+            self.save_answers()
+            self.items_changed(item.device)
+
+    def update_item(self, item: Item, **changes) -> None:
+        with self.lock:
+            for k, v in changes.items():
+                setattr(item, k, v)
+            self.items_changed(item.device)
+
+    def close_item(self, item: Item, outcome: str, text: str) -> None:
+        a = {"id": item.id, "outcome": outcome, "said": item.said, "text": text.replace("\t", " ")}
+        with self.lock:
+            self.items.get(item.device, {}).pop(item.id, None)
+            self.answers[item.device] = (self.answers.get(item.device, []) + [a])[-KEEP_ANSWERS:]
+            self.save_answers()
+            self.push(item.device, answer_line(a))
+            self.items_changed(item.device)
+
+    def ack(self, device: str, aid: str) -> None:
+        with self.lock:
+            kept = [a for a in self.answers.get(device, []) if a["id"] != aid]
+            if len(kept) != len(self.answers.get(device, [])):
+                self.answers[device] = kept
+                self.save_answers()
+
+    # Watch connections and over-the-air updates
+
+    def watch(self, rfile, status, header: dict) -> None:
+        """Register a watcher, send it the queue, unacked answers and any update offer, then read K and L frames
+        until the stick goes away. A read timeout is only a quiet stick."""
+        w = Watcher(header["device"], header.get("fw"), status)
+        with self.lock:
+            self.watchers.setdefault(w.device, []).append(w)
+            self.queue_sent[w.device] = self.queue_line(w.device)
+            status(self.queue_sent[w.device])
+            for a in self.answers.get(w.device, []):
+                status(answer_line(a))
+            self.offer(w)
+            self.note_applied(w)
+        try:
+            while True:
+                try:
+                    f = read_frame(rfile)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                if f is None:
+                    break
+                kind, payload = f
+                if kind == b"K":
+                    self.ack(w.device, payload.decode("ascii", "replace").strip())
+                elif kind == b"L":
+                    self.log_stick(header, payload)
+        finally:
+            self.unwatch(w)
+
+    def unwatch(self, w: Watcher) -> None:
+        with self.lock:
+            ws = self.watchers.get(w.device, [])
+            if w in ws:
+                ws.remove(w)
+
+    def heartbeat(self) -> None:
+        line = time_line()
+        with self.lock:
+            devices = list(self.watchers)
+        for device in devices:
+            self.push(device, line)
+
+    def offer(self, w: Watcher) -> None:
+        m = self.ota
+        if not m or w.fw == m["version"] or read_ota_key(self.cfg) is None:
+            return
+        if w.send(f"OTA {m['size']} {m['sha256']} {m['mac']} {m['version']}") is not False:
+            self.log_event({"event": "ota_offer", "device": w.device, "fw": w.fw, "version": m["version"]})
+
+    def note_applied(self, w: Watcher) -> None:
+        m = self.ota
+        marker = self.state / "ota" / "applied"
+        if not m or w.fw != m["version"]:
+            return
+        try:
+            if marker.read_text() == m["staged"]:
+                return
+        except OSError:
+            pass
+        write_atomic(marker, m["staged"].encode())
+        self.log_event({"event": "ota_applied", "device": w.device, "version": m["version"], "staged": m["staged"]})
+
+    def check_ota(self) -> None:
+        """Offer a newly staged or changed image to every watcher on another version."""
+        m = load_manifest(self.state)
+        with self.lock:
+            if m == self.ota:
+                return
+            self.ota = m
+            for ws in list(self.watchers.values()):
+                for w in list(ws):
+                    self.offer(w)
+
+    def tick_forever(self, stop: threading.Event) -> None:
+        n = 0
+        while not stop.wait(WATCH_TICK):
+            n += 1
+            self.check_ota()
+            if n % HEARTBEAT_EVERY == 0:
+                self.heartbeat()
+
+    def send_image(self, version: str, status, rec: dict) -> None:
+        m = load_manifest(self.state)
+        data = b""
+        if m and m["version"] == version:
+            try:
+                data = (self.state / "ota" / "image.bin").read_bytes()
+            except OSError:
+                pass
+        sha = hashlib.sha256(data).hexdigest()
+        if not data or len(data) != m["size"] or sha != m["sha256"]:
+            status("ERR no image")
+            self.log_event({"event": "ota_fetch", "version": version, "error": "no image", **rec})
+            return
+        t0 = now()
+        ok = status(f"IMAGE {len(data)} {sha}\n".encode() + data) is not False
+        self.log_event({"event": "ota_fetch", "version": version, "bytes": len(data),
+                        "seconds": round(now() - t0, 3), "ok": ok, **rec})
+
+    def log_stick(self, header: dict, payload: bytes) -> None:
+        self.log_event({"event": "stick_log", "device": header.get("device"), "fw": header.get("fw"),
+                        "text": payload[:STICK_LOG_BYTES].decode("utf-8", "replace")})
 
     def on_reply(self, reply: str, rec: dict) -> None:
         """Hand the reply on (a phone text, a notification). Runs after the stick already has the reply, so a
@@ -287,64 +574,92 @@ class Daemon:
             self.last_reply_file.write_text(line + "\n")
             status(f"REPLY {line}")
 
-    def process(self, get_text, status, rec: dict) -> None:
-        """Get the text (transcribe, or the status prompt), deliver, hand the reply on; `rec` collects the
-        timings written to events.jsonl."""
-        with self.work_lock:
-            try:
-                text = get_text()
-                rec["t_transcript"] = now()
-                rec["transcript_chars"] = len(text)
-                if not text:
-                    raise StepError("empty transcript")
-                reply = self.deliver(text, status, rec)
-                rec["t_reply"] = now()
-                rec["reply_chars"] = len(reply)
-                self.send_reply_to_stick(reply, status)
-                rec["t_done"] = now()
-                rec["outcome"] = "replied"
-                status("REPLIED")
-                self.hand_on(reply, rec)
-            except Offline:
-                rec["outcome"] = "offline"
-                status("OFFLINE")
-                if self.cfg.get("offline_message"):
-                    self.hand_on(self.cfg["offline_message"], rec)
-            except StepError as e:
-                rec["outcome"], rec["error"] = "error", str(e)
-                status(f"ERR {e}"[:60])
-            except Exception as e:
-                rec["outcome"], rec["error"] = "error", f"{type(e).__name__}: {e}"[:200]
-                status("ERR internal")
-            finally:
-                r = rec.get("t_release")
-                for k in ("t_transcript", "t_sent", "t_reply", "t_done"):
-                    if r and rec.get(k):
-                        rec["d_" + k[2:]] = round(rec[k] - r, 3)
-                rec["dry"] = self.dry
-                self.log_event({"event": "utterance", **rec})
+    def process(self, get_text, status, rec: dict, ticket: int, item: Item | None = None) -> None:
+        """Wait for this ticket's turn, get the text (transcribe, or the status prompt) and deliver it, then let
+        the next ticket through and wait for the reply holding nothing. `rec` collects the timings written to
+        events.jsonl; `item` (absent for bench) carries the queue state and becomes an ANSWER."""
+        text, answer = "", ""
+
+        def sent() -> None:
+            if "t_sent" in rec:
+                return
+            rec["t_sent"] = now()
+            status(f"SENT {text[:40]}")
+            self.turn.release(ticket)
+            row = {"event": "delivered", "id8": rec["utterance_id"][:8]}
+            if rec.get("t_release"):
+                row["d_sent"] = round(rec["t_sent"] - rec["t_release"], 3)
+            self.log_event(row)
+            if item:
+                self.mark_sent(item)
+
+        def report(kind: str) -> None:
+            if item:
+                self.update_item(item, report=kind)
+
+        try:
+            self.turn.wait(ticket)
+            text = get_text()
+            rec["t_transcript"] = now()
+            rec["transcript_chars"] = len(text)
+            if item:
+                item.said = flat(text[:40])
+            if not text:
+                raise StepError("empty transcript")
+            reply = self.deliver(text, rec, sent, report)
+            rec["t_reply"] = now()
+            rec["reply_chars"] = len(reply)
+            answer = stick_line(reply, int(self.cfg["stick_reply_chars"]))
+            self.send_reply_to_stick(reply, status)
+            rec["t_done"] = now()
+            rec["outcome"] = "replied"
+            status("REPLIED")
+            self.hand_on(reply, rec)
+        except Offline:
+            rec["outcome"], answer = "offline", "target offline"
+            status("OFFLINE")
+            if self.cfg.get("offline_message"):
+                self.hand_on(self.cfg["offline_message"], rec)
+        except StepError as e:
+            rec["outcome"], rec["error"] = "error", str(e)
+            answer = f"ERR {e}"[4:60]
+            status(f"ERR {e}"[:60])
+        except Exception as e:
+            rec["outcome"], rec["error"] = "error", f"{type(e).__name__}: {e}"[:200]
+            answer = "internal"
+            status("ERR internal")
+        finally:
+            self.turn.release(ticket)
+            if item:
+                self.close_item(item, rec.get("outcome") or "error", answer)
+            r = rec.get("t_release")
+            for k in ("t_transcript", "t_sent", "t_reply", "t_done"):
+                if r and rec.get(k):
+                    rec["d_" + k[2:]] = round(rec[k] - r, 3)
+            rec["dry"] = self.dry
+            self.log_event({"event": "utterance", **rec})
 
     # Server
+
+    def make_server(self, address: tuple) -> Server:
+        daemon = self
+
+        class Handler(socketserver.BaseRequestHandler):
+            def handle(self) -> None:
+                self.request.settimeout(150)
+                conn = Conn(self.request)
+                daemon.handle_stick(conn, conn.send, self.client_address[0])
+
+        return Server(address, Handler)
 
     def serve(self) -> None:
         self.state.mkdir(parents=True, exist_ok=True)
         state_file = self.state / "state.json"
         kill_stale_advertiser(state_file)
-        daemon = self
-
-        class Handler(socketserver.StreamRequestHandler):
-            def status(self, line: str) -> None:
-                try:
-                    self.wfile.write((line + "\n").encode())
-                    self.wfile.flush()
-                except OSError:
-                    pass
-
-            def handle(self) -> None:
-                self.request.settimeout(150)
-                daemon.handle_stick(self.rfile, self.status, self.client_address[0])
-
-        srv = Server(("0.0.0.0", int(self.cfg["port"])), Handler)
+        write_atomic(self.queue_file, b"{}")
+        srv = self.make_server(("0.0.0.0", int(self.cfg["port"])))
+        ticker_stop = threading.Event()
+        threading.Thread(target=self.tick_forever, args=(ticker_stop,), daemon=True).start()
         adv = None
         if self.cfg["advertise"]:
             adv = advertise(self.cfg["service_name"], self.cfg["service_type"], int(self.cfg["port"]))
@@ -365,6 +680,7 @@ class Daemon:
         try:
             srv.serve_forever()
         finally:
+            ticker_stop.set()
             if adv:
                 adv.terminate()
             srv.server_close()
@@ -378,32 +694,62 @@ class Daemon:
             self.log_event({"event": "dropped", "reason": type(e).__name__, **rec})
             return
         rec.update(u.header)
+        for text in u.logs:
+            self.log_stick(u.header, text)
+        if u.outcome == "watch":
+            self.watch(rfile, status, u.header)
+            return
+        if u.outcome == "fetch":
+            self.send_image(u.arg, status, rec)
+            return
         if u.outcome == "ping":
             last = self.last_reply()
             if last:
                 status(f"LAST {last}")
             return
-        if u.outcome == "status":
-            rec["kind"], rec["t_release"] = "status", now()
-            prompt = self.cfg.get("status_prompt")
-            if not prompt:
-                status("ERR no status_prompt")
-                self.log_event({"event": "status_unconfigured", **rec})
-                return
-            status("RECV")
-            self.process(lambda: prompt, status, rec)
+        if u.outcome == "status" and not self.cfg.get("status_prompt"):
+            status("ERR no status_prompt")
+            self.log_event({"event": "status_unconfigured", **rec})
             return
         if u.outcome == "too_long":
             status("ERR too long")
-        if u.outcome != "end":
+        if u.outcome not in ("end", "status"):
             self.log_event({"event": u.outcome, "bytes": len(u.pcm), **rec})
             return
-        rec["kind"], rec["t_release"] = "utterance", now()
-        rec["audio_s"] = round(len(u.pcm) / (RATE * 2), 2)
-        wav = self.save_wav(u.pcm, rec["utterance_id"])
-        rec["wav"] = wav.name
-        status("RECV")
-        self.process(lambda: self.transcribe(wav, status, rec), status, rec)
+        rec["kind"], rec["t_release"] = ("utterance" if u.outcome == "end" else "status"), now()
+        sid = u.arg if re.fullmatch(r"[0-9a-f]{8}", u.arg) else ""
+        if sid:
+            rec["utterance_id"] = sid + rec["utterance_id"][8:]
+        with self.lock:
+            dup = self.duplicate(rec["device"], sid) if sid else None
+            if not dup:
+                ticket = self.turn.take()
+                item = self.open_item(rec)
+        if dup:
+            status("RECV")
+            status(f"ID {sid}")
+            status(f"SENT {dup[1]}" if dup[0] == "delivered" else "ERR busy")
+            self.log_event({"event": "duplicate", "id8": sid, "device": rec["device"], "state": dup[0],
+                            "kind": rec["kind"]})
+            return
+        try:
+            if u.outcome == "end":
+                rec["audio_s"] = round(len(u.pcm) / (RATE * 2), 2)
+
+                def get_text() -> str:
+                    wav = self.save_wav(u.pcm, rec["utterance_id"])
+                    rec["wav"] = wav.name
+                    return self.transcribe(wav, status, rec)
+            else:
+                prompt = self.cfg["status_prompt"]
+                get_text = lambda: prompt
+            status("RECV")
+            status(f"ID {item.id}")
+            self.log_event({"event": "received", "utterance_id": rec["utterance_id"], "id8": item.id,
+                            "device": item.device, "kind": rec["kind"], "audio_s": rec.get("audio_s")})
+            self.process(get_text, status, rec, ticket, item)
+        finally:
+            self.turn.release(ticket)
 
 
 class Server(socketserver.ThreadingTCPServer):
@@ -411,42 +757,104 @@ class Server(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
 
+class Conn:
+    """A stick's socket. Reads keep partial data across a timeout, so a quiet watch connection can be read again;
+    send() may be called from any thread and returns False once the stick is gone."""
+
+    def __init__(self, sock: socket.socket):
+        self.sock, self.buf, self.lock = sock, bytearray(), threading.Lock()
+
+    def _fill(self) -> bool:
+        chunk = self.sock.recv(65536)
+        self.buf += chunk
+        return bool(chunk)
+
+    def _take(self, n: int) -> bytes:
+        out = bytes(self.buf[:n])
+        del self.buf[:n]
+        return out
+
+    def readline(self, limit: int) -> bytes:
+        while b"\n" not in self.buf and len(self.buf) < limit and self._fill():
+            pass
+        i = self.buf.find(b"\n", 0, limit)
+        return self._take(i + 1 if i >= 0 else limit)
+
+    def read(self, n: int) -> bytes:
+        while len(self.buf) < n and self._fill():
+            pass
+        return self._take(n)
+
+    def send(self, line: str | bytes) -> bool:
+        data = line if isinstance(line, bytes) else (line + "\n").encode()
+        with self.lock:
+            try:
+                self.sock.sendall(data)
+                return True
+            except OSError:
+                try:
+                    self.sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                return False
+
+
 class Utterance:
-    def __init__(self, outcome: str, header: dict, pcm: bytes):
-        self.outcome, self.header, self.pcm = outcome, header, pcm
+    def __init__(self, outcome: str, header: dict):
+        self.outcome, self.header = outcome, header
+        self.pcm = b""
+        self.arg = ""
+        self.logs: list[bytes] = []
+
+
+FRAME_OUTCOMES = {b"C": "cancel", b"E": "end", b"S": "status", b"P": "ping", b"W": "watch", b"F": "fetch"}
+
+
+def read_frame(rfile) -> tuple[bytes, bytes] | None:
+    """(type, payload), or None at end of stream. A timeout before a frame starts propagates as socket.timeout;
+    one inside a frame is an error."""
+    head = rfile.read(3)
+    if len(head) < 3:
+        return None
+    length = struct.unpack("<H", head[1:])[0]
+    try:
+        payload = rfile.read(length) if length else b""
+    except socket.timeout:
+        raise ConnectionError("timed out inside a frame")
+    return (head[:1], payload) if len(payload) == length else None
 
 
 def read_utterance(rfile, on_header=None) -> Utterance:
-    """Parse one M5R1 connection. outcome: end | status | ping | cancel | bad_header | truncated | too_long.
-    on_header(header) runs as soon as the HELLO line parses, before any frame is read."""
+    """Parse one M5R1 connection up to the frame that decides it. outcome: end | status | ping | cancel | watch |
+    fetch | bad_header | truncated | too_long. L frames on the way are collected in logs. on_header(header) runs
+    as soon as the HELLO line parses, before any frame is read."""
     words = rfile.readline(200).decode("ascii", "replace").split()
     if len(words) < 2 or words[0] != "M5R1":
-        return Utterance("bad_header", {}, b"")
+        return Utterance("bad_header", {})
     header = {"device": words[1], "battery": words[2] if len(words) > 2 else None,
               "fw": words[3] if len(words) > 3 else None, "t_connect": now()}
     if on_header:
         on_header(header)
-    pcm = bytearray()
+    u, pcm = Utterance("truncated", header), bytearray()
     while True:
-        head = rfile.read(3)
-        if len(head) < 3:
-            return Utterance("truncated", header, bytes(pcm))
-        kind, length = head[:1], struct.unpack("<H", head[1:])[0]
-        payload = rfile.read(length) if length else b""
-        if len(payload) < length:
-            return Utterance("truncated", header, bytes(pcm))
+        f = read_frame(rfile)
+        if f is None:
+            break
+        kind, payload = f
         if kind == b"A":
             pcm += payload
             if len(pcm) > MAX_AUDIO_BYTES:
-                return Utterance("too_long", header, bytes(pcm))
-        elif kind == b"C":
-            return Utterance("cancel", header, bytes(pcm))
-        elif kind == b"E":
-            return Utterance("end", header, bytes(pcm))
-        elif kind == b"S":
-            return Utterance("status", header, b"")
-        elif kind == b"P":
-            return Utterance("ping", header, b"")
+                u.outcome = "too_long"
+                break
+        elif kind == b"L":
+            u.logs.append(payload)
+        elif kind in FRAME_OUTCOMES:
+            u.outcome = FRAME_OUTCOMES[kind]
+            u.arg = payload.decode("ascii", "replace").strip()
+            break
+    if u.outcome in ("end", "cancel", "truncated", "too_long"):
+        u.pcm = bytes(pcm)
+    return u
 
 
 def time_line(t: float | None = None) -> str:
@@ -723,7 +1131,7 @@ def build_sink(cfg: dict) -> None:
 
 # Delivery
 
-def deliver_command(ccfg: dict, text: str, rec: dict, dry: bool, on_sent) -> str:
+def deliver_command(ccfg: dict, text: str, rec: dict, dry: bool, on_sent, on_status=lambda kind: None) -> str:
     argv = [os.path.expandvars(os.path.expanduser(a)) for a in ccfg["argv"]]
     if not argv:
         raise StepError("delivery argv empty")
@@ -739,10 +1147,14 @@ def deliver_command(ccfg: dict, text: str, rec: dict, dry: bool, on_sent) -> str
         err: list[str] = []
         drain = threading.Thread(target=lambda: err.append(p.stderr.read()), daemon=True)
         drain.start()
-        reply = []
+        reply, sent = [], False
         for line in p.stdout:
-            if line.strip() == "@sent" and not reply:
+            word = line.strip()
+            if word == "@sent" and not reply:
                 on_sent()
+                sent = True
+            elif word in ("@busy", "@running") and sent and not reply:
+                on_status(word[1:])
             else:
                 reply.append(line)
         rc = p.wait()
@@ -793,6 +1205,97 @@ def deliver_webhook(wcfg: dict, text: str, rec: dict, dry: bool) -> str:
         raise StepError(f"webhook {type(e).__name__}")
 
 
+# Over-the-air updates
+
+def read_ota_key(cfg: dict) -> bytes | None:
+    try:
+        text = expand(cfg["ota_key_file"]).read_text().strip()
+    except OSError:
+        return None
+    return bytes.fromhex(text) if re.fullmatch(r"[0-9a-fA-F]{64}", text) else None
+
+
+def ota_mac(key: bytes, sha256_hex: str, version: str) -> str:
+    return hmac.new(key, f"talkstick-ota {sha256_hex} {version}".encode(), hashlib.sha256).hexdigest()
+
+
+def load_manifest(state: Path) -> dict | None:
+    try:
+        m = json.loads((state / "ota" / "manifest.json").read_text())
+    except (OSError, ValueError):
+        return None
+    keys = ("version", "size", "sha256", "mac", "staged")
+    return m if isinstance(m, dict) and all(k in m for k in keys) else None
+
+
+def stage_ota(cfg: dict, image_path: str, version: str | None = None) -> dict:
+    """Copy a checked application image to state_dir/ota and write its manifest; the running daemon offers it
+    within a second. Returns the manifest."""
+    key_file = expand(cfg["ota_key_file"])
+    key = read_ota_key(cfg)
+    if key is None:
+        raise StepError(f"no OTA key in {key_file}: it must hold 64 hex characters (32 bytes), the same key the "
+                        "firmware build embeds. Create one with: openssl rand -hex 32 > " + str(key_file))
+    data = Path(image_path).expanduser().read_bytes()
+    if not data or data[0] != 0xE9:
+        raise StepError(f"{image_path} is not an ESP32 application image (first byte is not 0xE9)")
+    if len(data) > OTA_MAX_BYTES:
+        raise StepError(f"{image_path} is {len(data)} bytes, more than the app slot's {OTA_MAX_BYTES}")
+    if not version:
+        m = re.search(OTA_VERSION_RE, data)
+        if not m:
+            raise StepError("no talkstick-X.Y.Z version string in the image; pass --version")
+        version = m.group(0).decode()
+    sha = hashlib.sha256(data).hexdigest()
+    manifest = {"version": version, "size": len(data), "sha256": sha, "mac": ota_mac(key, sha, version),
+                "staged": time.strftime("%Y-%m-%dT%H:%M:%S") + f".{int(now() * 1000) % 1000:03d}"}
+    state = expand(cfg["state_dir"])
+    write_atomic(state / "ota" / "image.bin", data)
+    write_atomic(state / "ota" / "manifest.json", json.dumps(manifest, indent=1).encode())
+    return manifest
+
+
+def ota_cmd(d: Daemon, args: list[str]) -> None:
+    """talkstick ota IMAGE [--version V] [--timeout S]: stage, then wait for the stick to say hello with it."""
+    opts, rest = {"--version": None, "--timeout": "300"}, []
+    it = iter(args)
+    for a in it:
+        if a in opts:
+            opts[a] = next(it, None)
+        else:
+            rest.append(a)
+    if len(rest) != 1 or opts["--timeout"] is None:
+        sys.exit(__doc__)
+    try:
+        start = d.events.stat().st_size
+    except OSError:
+        start = 0
+    try:
+        m = stage_ota(d.cfg, rest[0], opts["--version"])
+    except (StepError, OSError) as e:
+        sys.exit(f"talkstick ota: {e}")
+    t0 = now()
+    print(f"staged {m['version']} ({m['size']} bytes, sha256 {m['sha256'][:12]}); waiting for the stick", flush=True)
+    while now() - t0 < float(opts["--timeout"]):
+        try:
+            with open(d.events, "rb") as f:
+                f.seek(start)
+                rows = f.read().decode("utf-8", "replace").splitlines()
+        except OSError:
+            rows = []
+        for row in rows:
+            try:
+                r = json.loads(row)
+            except ValueError:
+                continue
+            if r.get("event") == "ota_applied" and r.get("version") == m["version"]:
+                print(f"applied on {r.get('device')} after {now() - t0:.1f} s")
+                return
+        time.sleep(0.5)
+    sys.exit(f"talkstick ota: no stick said hello with {m['version']} within {opts['--timeout']} s "
+             "(the image stays staged)")
+
+
 # Advertising
 
 def advertise(name: str, stype: str, port: int) -> subprocess.Popen | None:
@@ -821,14 +1324,34 @@ def bench(d: Daemon, wav_path: str) -> None:
     t0 = rec["t_release"]
     wav = Path(wav_path).expanduser().resolve()
     out = lambda s: print(f"{now() - t0:6.2f}s  {s}", flush=True)
-    d.process(lambda: d.transcribe(wav, out, rec), out, rec)
+    d.process(lambda: d.transcribe(wav, out, rec), out, rec, d.turn.take())
     print(json.dumps({k: v for k, v in rec.items() if k.startswith("d_") or k in ("engine", "outcome", "error")}))
 
 
+def fake_watch(s: socket.socket) -> None:
+    """Print every watch line with the wall-clock time and ack each ANSWER, until the daemon closes."""
+    s.settimeout(30)
+    s.sendall(b"M5R1 fakestick 100 fake-1\nW\x00\x00")
+    try:
+        for raw in s.makefile("rb"):
+            line = raw.decode(errors="replace").rstrip("\n")
+            print(f"{time.strftime('%H:%M:%S')}  {line}", flush=True)
+            words = line.split()
+            if words[:1] == ["ANSWER"] and len(words) > 1:
+                s.sendall(b"K" + struct.pack("<H", len(words[1])) + words[1].encode())
+    except socket.timeout:
+        sys.exit("fake-stick: no line from the daemon for 30 s")
+    except KeyboardInterrupt:
+        pass
+
+
 def fake_stick(cfg: dict, mode: str, wav_path: str | None, target: str = "127.0.0.1") -> None:
-    """mode: utterance (stream wav_path then E), status (S), ping (P). Prints each line with seconds since the
-    last frame was sent; a ping reads until the daemon closes."""
+    """mode: utterance (stream wav_path then E), status (S), ping (P), watch (W). Prints each line with seconds
+    since the last frame was sent (watch: the time of day); a ping reads until the daemon closes."""
     host, _, port = target.partition(":")
+    if mode == "watch":
+        fake_watch(socket.create_connection((host, int(port or cfg["port"])), timeout=5))
+        return
     pcm = b""
     if mode == "utterance":
         with wave.open(wav_path, "rb") as w:
@@ -868,6 +1391,17 @@ def status_cmd(d: Daemon) -> None:
     for r in rows[-5:]:
         t = " ".join(f"{k[2:]}={r[k]}" for k in ("d_transcript", "d_sent", "d_reply", "d_done") if k in r)
         print(f"  {r['ts']} {r.get('engine')}/{r.get('delivery')} {r.get('outcome')} audio={r.get('audio_s')}s {t}")
+    try:
+        queues = json.loads(d.queue_file.read_text()) if up else {}
+    except (OSError, ValueError):
+        queues = {}
+    for device, q in queues.items():
+        waiting, busy, ahead = q["queue"]
+        print(f"queue {device}: waiting {waiting} busy {busy} ahead {ahead}")
+        for i in q["items"]:
+            print(f"  {i['id']} {i['state']} {now() - i['since']:.0f}s")
+    m = load_manifest(d.state)
+    print(f"ota: {m['version']} staged {m['staged']}" if m else "ota: nothing staged")
 
 
 def main(argv: list[str]) -> None:
@@ -883,8 +1417,9 @@ def main(argv: list[str]) -> None:
         bench(d, argv[2])
     elif cmd == "fake-stick" and len(argv) >= 3:
         args = argv[2:]
-        mode = "status" if "--status" in args else "ping" if "--ping" in args else "utterance"
-        args = [a for a in args if a not in ("--status", "--ping")]
+        flags = {"--status": "status", "--ping": "ping", "--watch": "watch"}
+        mode = next((flags[a] for a in args if a in flags), "utterance")
+        args = [a for a in args if a not in flags]
         if mode == "utterance" and not 1 <= len(args) <= 2:
             sys.exit(__doc__)
         if mode != "utterance" and len(args) > 1:
@@ -893,6 +1428,8 @@ def main(argv: list[str]) -> None:
         fake_stick(cfg, mode, wav, *args)
     elif cmd == "status":
         status_cmd(d)
+    elif cmd == "ota":
+        ota_cmd(d, argv[2:])
     elif cmd == "build-sink":
         build_sink(cfg)
     else:

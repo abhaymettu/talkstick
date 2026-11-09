@@ -2,7 +2,8 @@
 """talkstick delivery command: send the transcript to a T3 Code thread and print the agent's reply.
 
 Reads the transcript on stdin. Follows the talkstick delivery contract: prints "@sent" once `t3 thread send`
-succeeds, then the reply text; exit 3 when the thread is missing, settled or archived.
+succeeds, "@busy" while the thread runs some other turn and "@running" once this message's turn runs (each only
+when it changes), then the reply text; exit 3 when the thread is missing, settled or archived.
 
 Required environment:
   T3_BIN          path to the t3 CLI
@@ -103,6 +104,19 @@ def main() -> None:
     print("@sent", flush=True)
     deadline = time.time() + float(os.environ.get("T3_REPLY_TIMEOUT", "600"))
     poll = float(os.environ.get("T3_POLL", "3"))
+    shown = None
+
+    def mark(state: dict, run_id: str | None) -> None:
+        nonlocal shown
+        active = (state.get("thread") or {}).get("activeRunId")
+        want = "@running" if active and active == run_id else "@busy" if active else None
+        if want and want != shown:
+            print(want, flush=True)
+            shown = want
+
+    state = show(t3, tid, 40)
+    if state:
+        mark(state, find_reply(state, text, base, None)[0])
     run_id, empty_polls = None, 0
     while time.time() < deadline:
         time.sleep(poll)
@@ -110,6 +124,7 @@ def main() -> None:
         if not state:
             continue
         run_id, reply = find_reply(state, text, base, run_id)
+        mark(state, run_id)
         if reply is None:
             continue
         if reply.strip():

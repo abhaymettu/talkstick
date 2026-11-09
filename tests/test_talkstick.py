@@ -1,8 +1,14 @@
 """Run: python3 -m unittest discover -s tests"""
+import contextlib
+import hashlib
+import hmac
 import importlib.machinery
 import importlib.util
 import io
 import json
+import os
+import socket
+import subprocess
 import time
 import struct
 import sys
@@ -174,9 +180,10 @@ class Pipeline(unittest.TestCase):
     def test_round_trip_lines_and_timings(self):
         d, _ = self.daemon("import sys; sys.stdin.read(); print('@sent', flush=True); print('done')")
         lines, events = self.run_stick(d)
-        self.assertRegex(lines[0], r"^TIME \d+ -?\d+$")
-        self.assertEqual(lines[1:], ["RECV", "SENT turn on the lights", "REPLY done", "REPLIED"])
         row = events[-1]
+        self.assertRegex(lines[0], r"^TIME \d+ -?\d+$")
+        self.assertEqual(lines[1:], ["RECV", "ID " + row["utterance_id"][:8], "SENT turn on the lights", "REPLY done",
+                                     "REPLIED"])
         self.assertEqual(row["outcome"], "replied")
         for k in ("d_transcript", "d_sent", "d_reply", "d_done"):
             self.assertIn(k, row)
@@ -212,7 +219,7 @@ class Pipeline(unittest.TestCase):
     def test_offline(self):
         d, _ = self.daemon("import sys; sys.exit(3)")
         lines, events = self.run_stick(d)
-        self.assertEqual(lines[1:], ["RECV", "OFFLINE"])
+        self.assertEqual(lines[1:], ["RECV", "ID " + events[-1]["utterance_id"][:8], "OFFLINE"])
         self.assertEqual(events[-1]["outcome"], "offline")
 
     def test_cancel_logs_no_utterance(self):
@@ -231,8 +238,9 @@ class Pipeline(unittest.TestCase):
         d, _ = self.daemon("import sys; t=sys.stdin.read(); print('@sent', flush=True); print('status of: ' + t)",
                            status_prompt="what is running")
         lines = self.stick(d, frame(b"A", b"\x00\x00"), frame(b"S"))
-        self.assertEqual(lines[1:], ["RECV", "SENT what is running", "REPLY status of: what is running", "REPLIED"])
         row = json.loads(d.events.read_text().splitlines()[-1])
+        self.assertEqual(lines[1:], ["RECV", "ID " + row["utterance_id"][:8], "SENT what is running",
+                                     "REPLY status of: what is running", "REPLIED"])
         self.assertEqual((row["kind"], row["outcome"]), ("status", "replied"))
 
     def test_status_request_without_prompt(self):
@@ -260,6 +268,321 @@ class Pipeline(unittest.TestCase):
         self.assertEqual(ts.trim_reply("x" * 10, 4, " (more)"), "xxxx (more)")
         self.assertEqual(ts.trim_reply("short", 600, " (more)"), "short")
         self.assertEqual(ts.trim_reply("x" * 10, None, " (more)"), "x" * 10)
+
+ENGINE = ("import sys, time, wave; n = wave.open(sys.argv[1]).getnframes();"
+          " time.sleep(float(sys.argv[2]) if n == 100 else 0); print('utt%d' % n)")
+
+DELIVER = """
+import os, sys, time
+d, t = sys.argv[1], sys.stdin.read().strip()
+open(os.path.join(d, 'delivered'), 'a').write(t + '\\n')
+print('@sent', flush=True)
+for step in sys.argv[2:]:
+    if step.startswith('@'):
+        print(step, flush=True)
+    else:
+        while not os.path.exists(os.path.join(d, step + '-' + t)):
+            time.sleep(0.02)
+print('re ' + t)
+"""
+
+KEY = bytes(range(32))
+IMAGE = b"\xe9" + b"\x00" * 100 + b"talkstick-0.3.1\x00" + b"\xff" * 50
+
+
+class Queue(unittest.TestCase):
+    """Utterances from one stick: delivered in press order without waiting for replies, answers on a watch."""
+
+    def setUp(self):
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        self.tmp = Path(holder.name)
+
+    def daemon(self, steps=(), slow=0.0, **over):
+        self.cfg = ts.merge(ts.DEFAULTS, {
+            "state_dir": str(self.tmp / "state"), "advertise": False, "ota_key_file": str(self.tmp / "ota.key"),
+            "engine": {"type": "command", "command": {"argv": py(ENGINE) + ["{wav}", str(slow)]}},
+            "delivery": {"type": "command", "command": {"argv": py(DELIVER) + [str(self.tmp), *steps]}}, **over})
+        return ts.Daemon(self.cfg)
+
+    def press(self, d, n, sid=b""):
+        lines = []
+        t = threading.Thread(target=d.handle_stick, daemon=True, args=(
+            stream(frame(b"A", b"\x00\x00" * n), frame(b"E", sid)), lines.append, "127.0.0.1"))
+        t.start()
+        return t, lines
+
+    def until(self, cond, timeout=10):
+        end = time.time() + timeout
+        while time.time() < end:
+            if cond():
+                return
+            time.sleep(0.02)
+        self.fail("condition not met in time")
+
+    def touch(self, name):
+        (self.tmp / name).touch()
+
+    def delivered(self):
+        return (self.tmp / "delivered").read_text().split()
+
+    def events(self, d, kind):
+        return [r for r in map(json.loads, d.events.read_text().splitlines()) if r.get("event") == kind]
+
+    def serve(self, d):
+        srv = d.make_server(("127.0.0.1", 0))
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return srv.server_address[1]
+
+    def watch(self, port, fw="talkstick-0.3.0"):
+        s = socket.create_connection(("127.0.0.1", port), timeout=10)
+        self.addCleanup(s.close)
+        s.sendall(f"M5R1 aabbcc 87 {fw}\n".encode() + frame(b"W"))
+        f = s.makefile("rb")
+        self.assertRegex(f.readline().decode(), r"^TIME \d+ -?\d+\n$")
+        return s, f
+
+    def next_line(self, f):
+        while True:
+            line = f.readline().decode().rstrip("\n")
+            if not line.startswith("TIME "):
+                return line
+
+    def quick_watch(self, d, fw="1.0", *frames):
+        lines = []
+        d.handle_stick(stream(frame(b"W"), *frames, header=f"M5R1 aabbcc 87 {fw}\n".encode()), lines.append, "x")
+        return lines[1:]
+
+    def test_second_utterance_delivered_while_first_waits_for_its_reply(self):
+        d = self.daemon(["go"])
+        t1, l1 = self.press(d, 100)
+        self.until(lambda: "SENT utt100" in l1)
+        t2, l2 = self.press(d, 200)
+        self.until(lambda: "SENT utt200" in l2)
+        self.assertNotIn("REPLIED", l1)
+        self.touch("go-utt200")
+        t2.join(10)
+        self.assertEqual(l2[-2:], ["REPLY re utt200", "REPLIED"])
+        self.touch("go-utt100")
+        t1.join(10)
+        self.assertEqual(l1[-2:], ["REPLY re utt100", "REPLIED"])
+        self.assertEqual(self.delivered(), ["utt100", "utt200"])
+
+    def test_press_order_kept_when_the_first_transcribes_slowest(self):
+        d = self.daemon(slow=0.8)
+        threads = []
+        for n in (100, 200, 300):
+            t, lines = self.press(d, n)
+            self.until(lambda: "RECV" in lines)
+            threads.append(t)
+        for t in threads:
+            t.join(10)
+        self.assertEqual(self.delivered(), ["utt100", "utt200", "utt300"])
+
+    def test_received_and_delivered_events_before_the_final_row(self):
+        d = self.daemon()
+        t, lines = self.press(d, 100)
+        t.join(10)
+        rows = [json.loads(l) for l in d.events.read_text().splitlines()]
+        self.assertEqual([r["event"] for r in rows], ["received", "delivered", "utterance"])
+        uid = rows[2]["utterance_id"]
+        self.assertEqual(lines[2], "ID " + uid[:8])
+        self.assertRegex(lines[2], r"^ID [0-9a-f]{8}$")
+        self.assertEqual({k: rows[0][k] for k in ("utterance_id", "id8", "device", "kind", "audio_s")},
+                         {"utterance_id": uid, "id8": uid[:8], "device": "aabbcc", "kind": "utterance",
+                          "audio_s": 0.01})
+        self.assertEqual(rows[1]["id8"], uid[:8])
+        self.assertEqual(rows[1]["d_sent"], rows[2]["d_sent"])
+
+    def test_watch_gets_queue_and_answer_and_ack_removes_it(self):
+        d = self.daemon(["go"])
+        s, f = self.watch(self.serve(d))
+        self.assertEqual(self.next_line(f), "QUEUE 0 0 0")
+        t, lines = self.press(d, 100)
+        self.assertEqual(self.next_line(f), "QUEUE 1 0 0")
+        self.touch("go-utt100")
+        t.join(10)
+        aid = lines[2].split()[1]
+        self.assertEqual(self.next_line(f), f"ANSWER {aid} replied utt100\tre utt100")
+        self.assertEqual(self.next_line(f), "QUEUE 0 0 0")
+        self.assertEqual(self.quick_watch(d)[1:], [f"ANSWER {aid} replied utt100\tre utt100"])
+        s.sendall(frame(b"K", aid.encode()))
+        self.until(lambda: json.loads((self.tmp / "state/answers.json").read_text())["answers"] == {"aabbcc": []})
+        self.assertEqual(self.quick_watch(d), ["QUEUE 0 0 0"])
+
+    def test_unacked_answers_survive_a_restart_and_keep_the_newest_eight(self):
+        d = self.daemon()
+        for n in range(100, 110):
+            self.press(d, n)[0].join(10)
+        lines = self.quick_watch(ts.Daemon(self.cfg))
+        self.assertEqual(lines[0], "QUEUE 0 0 0")
+        self.assertEqual([l.split("\t")[1] for l in lines[1:]], [f"re utt{n}" for n in range(102, 110)])
+        self.assertTrue(all(l.split()[2] == "replied" for l in lines[1:]))
+
+    def test_busy_and_running_drive_queue(self):
+        d = self.daemon(["@busy", "run", "@running", "go"])
+        s, f = self.watch(self.serve(d))
+        self.assertEqual(self.next_line(f), "QUEUE 0 0 0")
+        self.press(d, 100)
+        self.assertEqual([self.next_line(f), self.next_line(f)], ["QUEUE 1 0 0", "QUEUE 1 1 1"])
+        self.press(d, 200)
+        self.assertEqual(self.next_line(f), "QUEUE 2 1 2")
+        self.touch("run-utt100")
+        self.assertEqual(self.next_line(f), "QUEUE 2 0 1")
+        self.touch("go-utt100")
+        self.assertRegex(self.next_line(f), r"^ANSWER [0-9a-f]{8} replied utt100\tre utt100$")
+        self.assertEqual(self.next_line(f), "QUEUE 1 1 1")
+        self.touch("run-utt200")
+        self.assertEqual(self.next_line(f), "QUEUE 1 0 0")
+        self.touch("go-utt200")
+        self.assertRegex(self.next_line(f), r"^ANSWER [0-9a-f]{8} replied utt200\tre utt200$")
+        self.assertEqual(self.next_line(f), "QUEUE 0 0 0")
+
+    def test_status_command_lists_in_flight_items(self):
+        d = self.daemon(["@busy", "go"])
+        d.cfg["port"] = self.serve(d)
+        t, lines = self.press(d, 100)
+        queue = self.tmp / "state/queue.json"
+        self.until(lambda: queue.exists() and '"busy"' in queue.read_text())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ts.status_cmd(d)
+        self.assertIn("queue aabbcc: waiting 1 busy 1 ahead 1\n", out.getvalue())
+        self.assertRegex(out.getvalue(), r"\n  " + lines[2].split()[1] + r" busy \d+s\n")
+        self.assertIn("ota: nothing staged", out.getvalue())
+        self.touch("go-utt100")
+        t.join(10)
+
+    def test_stick_log_frame_on_watch_and_before_end(self):
+        d = self.daemon()
+        self.quick_watch(d, "talkstick-0.3.0", frame(b"L", b"wifi: no ap x3"))
+        u = ts.read_utterance(stream(frame(b"A", b"\x01\x00"), frame(b"L", b"boot 4"), frame(b"E")))
+        self.assertEqual((u.outcome, u.pcm, u.logs), ("end", b"\x01\x00", [b"boot 4"]))
+        d.handle_stick(stream(frame(b"L", b"x" * 1500), frame(b"C")), lambda _: None, "x")
+        rows = self.events(d, "stick_log")
+        self.assertEqual(rows[0]["device"], "aabbcc")
+        self.assertEqual((rows[0]["fw"], rows[0]["text"]), ("talkstick-0.3.0", "wifi: no ap x3"))
+        self.assertEqual(rows[1]["text"], "x" * 1024)
+
+    def test_stick_id_names_the_item(self):
+        d = self.daemon()
+        t, lines = self.press(d, 100, b"0badc0de")
+        t.join(10)
+        self.assertEqual(lines[1:3], ["RECV", "ID 0badc0de"])
+        self.assertEqual(self.quick_watch(d)[1:], ["ANSWER 0badc0de replied utt100\tre utt100"])
+        self.assertTrue(self.events(d, "utterance")[0]["utterance_id"].startswith("0badc0de"))
+        t, lines = self.press(d, 200, b"NOT-HEX!")
+        t.join(10)
+        self.assertRegex(lines[2], r"^ID [0-9a-f]{8}$")
+        self.assertNotEqual(lines[2], "ID NOT-HEX!")
+
+    def test_resent_delivered_id_is_not_delivered_again(self):
+        d = self.daemon()
+        self.press(d, 100, b"0badc0de")[0].join(10)
+        for daemon in (d, ts.Daemon(self.cfg)):
+            t, lines = self.press(daemon, 100, b"0badc0de")
+            t.join(10)
+            self.assertEqual(lines[1:], ["RECV", "ID 0badc0de", "SENT utt100"])
+        self.assertEqual(self.delivered(), ["utt100"])
+        self.assertEqual([(r["id8"], r["state"]) for r in self.events(d, "duplicate")],
+                         [("0badc0de", "delivered")] * 2)
+
+    def test_resent_id_still_in_progress_is_busy(self):
+        d = self.daemon(slow=1.0)
+        t1, l1 = self.press(d, 100, b"0badc0de")
+        self.until(lambda: "RECV" in l1)
+        t2, l2 = self.press(d, 100, b"0badc0de")
+        t2.join(10)
+        self.assertEqual(l2[1:], ["RECV", "ID 0badc0de", "ERR busy"])
+        t1.join(10)
+        self.assertEqual(l1[-1], "REPLIED")
+        self.assertEqual(self.delivered(), ["utt100"])
+        self.assertEqual([r["state"] for r in self.events(d, "duplicate")], ["in_progress"])
+
+    # Over-the-air updates
+
+    def stage(self, version=None):
+        (self.tmp / "ota.key").write_text(KEY.hex() + "\n")
+        (self.tmp / "app.bin").write_bytes(IMAGE)
+        return ts.stage_ota(self.cfg, str(self.tmp / "app.bin"), version)
+
+    def test_staging_writes_image_manifest_and_mac(self):
+        self.daemon()
+        m = self.stage()
+        sha = hashlib.sha256(IMAGE).hexdigest()
+        mac = hmac.new(KEY, f"talkstick-ota {sha} talkstick-0.3.1".encode(), hashlib.sha256).hexdigest()
+        self.assertEqual({k: m[k] for k in ("version", "size", "sha256", "mac")},
+                         {"version": "talkstick-0.3.1", "size": len(IMAGE), "sha256": sha, "mac": mac})
+        self.assertEqual(json.loads((self.tmp / "state/ota/manifest.json").read_text()), m)
+        self.assertEqual((self.tmp / "state/ota/image.bin").read_bytes(), IMAGE)
+        self.assertEqual(self.stage("talkstick-9.9.9")["version"], "talkstick-9.9.9")
+        (self.tmp / "app.bin").write_bytes(b"\x00" + IMAGE)
+        with self.assertRaises(ts.StepError):
+            ts.stage_ota(self.cfg, str(self.tmp / "app.bin"))
+
+    def test_offer_only_on_version_mismatch_and_only_with_a_key(self):
+        d = self.daemon()
+        s, f = self.watch(self.serve(d))
+        self.assertEqual(self.next_line(f), "QUEUE 0 0 0")
+        m = self.stage()
+        d.check_ota()
+        offer = f"OTA {m['size']} {m['sha256']} {m['mac']} talkstick-0.3.1"
+        self.assertEqual(self.next_line(f), offer)
+        self.assertEqual(self.quick_watch(d, "talkstick-0.3.0"), ["QUEUE 0 0 0", offer])
+        self.assertEqual(self.quick_watch(d, "talkstick-0.3.1"), ["QUEUE 0 0 0"])
+        (self.tmp / "ota.key").unlink()
+        self.assertEqual(self.quick_watch(d, "talkstick-0.3.0"), ["QUEUE 0 0 0"])
+        self.assertEqual(len(self.events(d, "ota_offer")), 2)
+
+    def test_fetch_returns_the_exact_image(self):
+        d = self.daemon()
+        self.stage()
+        lines = []
+        d.handle_stick(stream(frame(b"F", b"talkstick-0.3.1")), lines.append, "x")
+        self.assertEqual(lines[1], f"IMAGE {len(IMAGE)} {hashlib.sha256(IMAGE).hexdigest()}\n".encode() + IMAGE)
+        lines = []
+        d.handle_stick(stream(frame(b"F", b"talkstick-0.3.2")), lines.append, "x")
+        self.assertEqual(lines[1:], ["ERR no image"])
+        self.assertEqual([r.get("bytes") for r in self.events(d, "ota_fetch")], [len(IMAGE), None])
+
+    def test_ota_applied_logged_once_per_staging(self):
+        d = self.daemon()
+        self.stage()
+        d.check_ota()
+        self.quick_watch(d, "talkstick-0.3.1")
+        self.quick_watch(d, "talkstick-0.3.1")
+        self.assertEqual(len(self.events(d, "ota_applied")), 1)
+        time.sleep(0.01)
+        self.stage()
+        d.check_ota()
+        self.quick_watch(d, "talkstick-0.3.1")
+        self.assertEqual([r["device"] for r in self.events(d, "ota_applied")], ["aabbcc", "aabbcc"])
+
+    def ota_cli(self, *args):
+        (self.tmp / "config.json").write_text(json.dumps(self.cfg))
+        env = {**os.environ, "TALKSTICK_CONFIG": str(self.tmp / "config.json")}
+        return subprocess.Popen([sys.executable, str(ROOT / "daemon/talkstick"), "ota", str(self.tmp / "app.bin"),
+                                 *args], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def test_ota_command_waits_for_the_stick(self):
+        d = self.daemon()
+        (self.tmp / "app.bin").write_bytes(IMAGE)
+        p = self.ota_cli("--timeout", "5")
+        self.assertEqual(p.communicate(timeout=10)[1].strip().split(":")[0], "talkstick ota")
+        self.assertEqual(p.returncode, 1)
+        (self.tmp / "ota.key").write_text(KEY.hex())
+        p = self.ota_cli("--timeout", "20")
+        self.until(lambda: (self.tmp / "state/ota/manifest.json").exists())
+        d.check_ota()
+        self.quick_watch(d, "talkstick-0.3.1")
+        out, _ = p.communicate(timeout=10)
+        self.assertEqual(p.returncode, 0)
+        self.assertRegex(out, r"applied on aabbcc after [\d.]+ s\n$")
+        p = self.ota_cli("--timeout", "0.5", "--version", "talkstick-0.4.0")
+        self.assertIn("no stick said hello with talkstick-0.4.0", p.communicate(timeout=10)[1])
+        self.assertEqual(p.returncode, 1)
 
 
 if __name__ == "__main__":
