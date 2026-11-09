@@ -180,6 +180,21 @@ class Pipeline(unittest.TestCase):
         for k in ("d_transcript", "d_sent", "d_reply", "d_done"):
             self.assertIn(k, row)
 
+    def test_failing_on_reply_keeps_the_reply(self):
+        d, _ = self.daemon("print('done')", on_reply=py("import sys; sys.exit(1)"))
+        lines, events = self.run_stick(d)
+        self.assertEqual(lines[-2:], ["REPLY done", "REPLIED"])
+        row = [e for e in events if e.get("event") == "utterance"][-1]
+        self.assertEqual((row["outcome"], row["on_reply_rc"]), ("replied", 1))
+
+    def test_on_reply_timeout_is_logged_not_raised(self):
+        d, _ = self.daemon("print('done')", on_reply=py("import time; time.sleep(5)"), on_reply_timeout=0.2)
+        lines, events = self.run_stick(d)
+        self.assertEqual(lines[-1], "REPLIED")
+        row = [e for e in events if e.get("event") == "utterance"][-1]
+        self.assertEqual(row["on_reply_rc"], "failed")
+        self.assertIn("TimeoutExpired", row["on_reply_error"])
+
     def test_offline(self):
         d, _ = self.daemon("import sys; sys.exit(3)")
         lines, events = self.run_stick(d)

@@ -89,6 +89,7 @@ DEFAULTS: dict = {
     "offline_message": None,
     "reply_max_chars": None,
     "reply_more_suffix": " (more)",
+    "on_reply_timeout": 90,
     "status_prompt": None,
     "stick_reply_chars": STICK_REPLY_CHARS,
 }
@@ -206,6 +207,8 @@ class Daemon:
             status(f"SENT {text[:40]}")
 
     def on_reply(self, reply: str, rec: dict) -> None:
+        """Hand the reply on (a phone text, a notification). Runs after the stick already has the reply, so a
+        failure here is logged in the event row and never turns a delivered reply into an error."""
         argv = self.cfg.get("on_reply")
         if not argv or not reply.strip():
             return
@@ -214,11 +217,16 @@ class Daemon:
             print(f"[dry] on_reply {argv[0]} <- {len(msg)} chars", flush=True)
             rec["on_reply_rc"] = "dry"
             return
-        p = subprocess.run(argv, input=msg, capture_output=True, text=True, timeout=60)
-        rec["on_reply_rc"] = p.returncode
-        if p.returncode != 0:
-            self.log_event({"event": "on_reply_failed", "rc": p.returncode, "stderr": p.stderr.strip()[-200:]})
-            raise StepError("on_reply failed")
+        try:
+            p = subprocess.run(argv, input=msg, capture_output=True, text=True,
+                               timeout=float(self.cfg["on_reply_timeout"]))
+            rec["on_reply_rc"], err = p.returncode, p.stderr.strip()[-200:]
+        except (OSError, subprocess.TimeoutExpired) as e:
+            rec["on_reply_rc"], err = "failed", f"{type(e).__name__}: {e}"[:200]
+        rec["t_on_reply"] = now()
+        if rec["on_reply_rc"] != 0:
+            rec["on_reply_error"] = err
+            self.log_event({"event": "on_reply_failed", "rc": rec["on_reply_rc"], "stderr": err})
 
     # Pipeline
 
@@ -266,20 +274,16 @@ class Daemon:
                 reply = self.deliver(text, status, rec)
                 rec["t_reply"] = now()
                 rec["reply_chars"] = len(reply)
-                self.on_reply(reply, rec)
                 self.send_reply_to_stick(reply, status)
                 rec["t_done"] = now()
                 rec["outcome"] = "replied"
                 status("REPLIED")
+                self.on_reply(reply, rec)
             except Offline:
                 rec["outcome"] = "offline"
-                msg = self.cfg.get("offline_message")
-                try:
-                    if msg:
-                        self.on_reply(msg, rec)
-                except StepError as e:
-                    rec["error"] = str(e)
                 status("OFFLINE")
+                if self.cfg.get("offline_message"):
+                    self.on_reply(self.cfg["offline_message"], rec)
             except StepError as e:
                 rec["outcome"], rec["error"] = "error", str(e)
                 status(f"ERR {e}"[:60])
@@ -288,7 +292,7 @@ class Daemon:
                 status("ERR internal")
             finally:
                 r = rec.get("t_release")
-                for k in ("t_transcript", "t_sent", "t_reply", "t_done"):
+                for k in ("t_transcript", "t_sent", "t_reply", "t_done", "t_on_reply"):
                     if r and rec.get(k):
                         rec["d_" + k[2:]] = round(rec[k] - r, 3)
                 rec["dry"] = self.dry

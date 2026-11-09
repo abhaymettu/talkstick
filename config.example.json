@@ -53,6 +53,7 @@
   },
 
   "on_reply": null,
+  "on_reply_timeout": 90,
   "_on_reply": "argv run with the reply on stdin, e.g. [\"notify-send\", \"talkstick\"] or a script that texts your phone; printed instead of run in dry mode",
   "offline_message": null,
   "_offline_message": "if set, sent through on_reply when the target is offline",
