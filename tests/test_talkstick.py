@@ -399,46 +399,46 @@ class Queue(unittest.TestCase):
     def test_watch_gets_queue_and_answer_and_ack_removes_it(self):
         d = self.daemon(["go"])
         s, f = self.watch(self.serve(d))
-        self.assertEqual(self.next_line(f), "QUEUE 0 0 0")
+        self.assertEqual(self.next_line(f), "QUEUE 0 0 0 0")
         t, lines = self.press(d, 100)
-        self.assertEqual(self.next_line(f), "QUEUE 1 0 0")
+        self.assertEqual(self.next_line(f), "QUEUE 1 0 0 0")
         self.touch("go-utt100")
         t.join(10)
         aid = lines[2].split()[1]
         self.assertEqual(self.next_line(f), f"ANSWER {aid} replied utt100\tre utt100")
-        self.assertEqual(self.next_line(f), "QUEUE 0 0 0")
+        self.assertEqual(self.next_line(f), "QUEUE 0 0 0 0")
         self.assertEqual(self.quick_watch(d)[1:], [f"ANSWER {aid} replied utt100\tre utt100"])
         s.sendall(frame(b"K", aid.encode()))
         self.until(lambda: json.loads((self.tmp / "state/answers.json").read_text())["answers"] == {"aabbcc": []})
-        self.assertEqual(self.quick_watch(d), ["QUEUE 0 0 0"])
+        self.assertEqual(self.quick_watch(d), ["QUEUE 0 0 0 0"])
 
     def test_unacked_answers_survive_a_restart_and_keep_the_newest_eight(self):
         d = self.daemon()
         for n in range(100, 110):
             self.press(d, n)[0].join(10)
         lines = self.quick_watch(ts.Daemon(self.cfg))
-        self.assertEqual(lines[0], "QUEUE 0 0 0")
+        self.assertEqual(lines[0], "QUEUE 0 0 0 0")
         self.assertEqual([l.split("\t")[1] for l in lines[1:]], [f"re utt{n}" for n in range(102, 110)])
         self.assertTrue(all(l.split()[2] == "replied" for l in lines[1:]))
 
     def test_busy_and_running_drive_queue(self):
         d = self.daemon(["@busy", "run", "@running", "go"])
         s, f = self.watch(self.serve(d))
-        self.assertEqual(self.next_line(f), "QUEUE 0 0 0")
+        self.assertEqual(self.next_line(f), "QUEUE 0 0 0 0")
         self.press(d, 100)
-        self.assertEqual([self.next_line(f), self.next_line(f)], ["QUEUE 1 0 0", "QUEUE 1 1 1"])
+        self.assertEqual([self.next_line(f), self.next_line(f)], ["QUEUE 1 0 0 0", "QUEUE 1 1 1 0"])
         self.press(d, 200)
-        self.assertEqual(self.next_line(f), "QUEUE 2 1 2")
+        self.assertEqual(self.next_line(f), "QUEUE 2 1 2 0")
         self.touch("run-utt100")
-        self.assertEqual(self.next_line(f), "QUEUE 2 0 1")
+        self.assertEqual(self.next_line(f), "QUEUE 2 0 1 0")
         self.touch("go-utt100")
         self.assertRegex(self.next_line(f), r"^ANSWER [0-9a-f]{8} replied utt100\tre utt100$")
-        self.assertEqual(self.next_line(f), "QUEUE 1 1 1")
+        self.assertEqual(self.next_line(f), "QUEUE 1 1 1 0")
         self.touch("run-utt200")
-        self.assertEqual(self.next_line(f), "QUEUE 1 0 0")
+        self.assertEqual(self.next_line(f), "QUEUE 1 0 0 0")
         self.touch("go-utt200")
         self.assertRegex(self.next_line(f), r"^ANSWER [0-9a-f]{8} replied utt200\tre utt200$")
-        self.assertEqual(self.next_line(f), "QUEUE 0 0 0")
+        self.assertEqual(self.next_line(f), "QUEUE 0 0 0 0")
 
     def test_status_command_lists_in_flight_items(self):
         d = self.daemon(["@busy", "go"])
@@ -449,7 +449,7 @@ class Queue(unittest.TestCase):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             ts.status_cmd(d)
-        self.assertIn("queue aabbcc: waiting 1 busy 1 ahead 1\n", out.getvalue())
+        self.assertIn("queue aabbcc: waiting 1 busy 1 ahead 1 paused 0\n", out.getvalue())
         self.assertRegex(out.getvalue(), r"\n  " + lines[2].split()[1] + r" busy \d+s\n")
         self.assertIn("ota: nothing staged", out.getvalue())
         self.touch("go-utt100")
@@ -501,6 +501,59 @@ class Queue(unittest.TestCase):
         self.assertEqual(self.delivered(), ["utt100"])
         self.assertEqual([r["state"] for r in self.events(d, "duplicate")], ["in_progress"])
 
+    def test_handoff_timeout_ends_in_error_and_the_id_may_be_resent(self):
+        code = ("import os, sys, time; sys.stdin.read(); d = sys.argv[1]; first = not os.path.exists(d + '/tried');"
+                " open(d + '/tried', 'w').close(); time.sleep(5) if first else print('@sent', flush=True);"
+                " print('ok')")
+        d = self.daemon()
+        d.cfg["delivery"]["command"] = {"argv": py(code) + [str(self.tmp)], "handoff_timeout": 0.3, "timeout": 20}
+        t0 = time.time()
+        t, lines = self.press(d, 100, b"0badc0de")
+        t.join(10)
+        self.assertLess(time.time() - t0, 3)
+        self.assertEqual(lines[-1], "ERR not posted: the thread did not take it in 0.3 s")
+        self.assertEqual(self.quick_watch(d)[1:],
+                         ["ANSWER 0badc0de error utt100\tnot posted: the thread did not take it in 0.3 s"])
+        t, lines = self.press(d, 100, b"0badc0de")
+        t.join(10)
+        self.assertEqual(lines[1:], ["RECV", "ID 0badc0de", "SENT utt100", "REPLY ok", "REPLIED"])
+
+    def test_spoken_at_and_stderr_reason(self):
+        d = self.daemon()
+        d.cfg["delivery"]["command"]["argv"] = py(
+            "import os, sys; print(os.environ['TALKSTICK_SPOKEN_AT'], file=sys.stderr); sys.exit(4)")
+        t, lines = self.press(d, 100)
+        t.join(10)
+        row = self.events(d, "utterance")[0]
+        self.assertEqual(lines[-1], f"ERR {int(row['t_release'])}")
+
+    def test_paused_is_the_fourth_queue_field(self):
+        d = self.daemon(["@busy", "p", "@paused", "go"])
+        s, f = self.watch(self.serve(d))
+        self.assertEqual(self.next_line(f), "QUEUE 0 0 0 0")
+        self.press(d, 100)
+        self.assertEqual([self.next_line(f), self.next_line(f)], ["QUEUE 1 0 0 0", "QUEUE 1 1 1 0"])
+        self.touch("p-utt100")
+        self.assertEqual(self.next_line(f), "QUEUE 1 0 0 1")
+        self.touch("go-utt100")
+        self.assertRegex(self.next_line(f), r"^ANSWER ")
+        self.assertEqual(self.next_line(f), "QUEUE 0 0 0 0")
+
+    def test_on_reply_unacked_skips_answers_the_stick_acked(self):
+        out = self.tmp / "phone"
+        d = self.daemon(on_reply_when="unacked", on_reply_grace=1.5,
+                        on_reply=py(f"import sys; open({str(out)!r}, 'a').write(sys.stdin.read() + '|')"))
+        s, f = self.watch(self.serve(d))
+        self.next_line(f)
+        self.press(d, 100)[0].join(10)
+        aid = next(l for l in iter(lambda: self.next_line(f), "") if l.startswith("ANSWER")).split()[1]
+        s.sendall(frame(b"K", aid.encode()))
+        self.press(d, 200)[0].join(10)
+        d.wait_replies(10)
+        self.assertEqual(out.read_text(), "re utt200|")
+        self.assertEqual([(r["rc"], r.get("decision")) for r in self.events(d, "on_reply")],
+                         [("skipped", "skipped: acked by stick"), (0, "sent: not acked in 1.5 s")])
+
     # Over-the-air updates
 
     def stage(self, version=None):
@@ -525,15 +578,15 @@ class Queue(unittest.TestCase):
     def test_offer_only_on_version_mismatch_and_only_with_a_key(self):
         d = self.daemon()
         s, f = self.watch(self.serve(d))
-        self.assertEqual(self.next_line(f), "QUEUE 0 0 0")
+        self.assertEqual(self.next_line(f), "QUEUE 0 0 0 0")
         m = self.stage()
         d.check_ota()
         offer = f"OTA {m['size']} {m['sha256']} {m['mac']} talkstick-0.3.1"
         self.assertEqual(self.next_line(f), offer)
-        self.assertEqual(self.quick_watch(d, "talkstick-0.3.0"), ["QUEUE 0 0 0", offer])
-        self.assertEqual(self.quick_watch(d, "talkstick-0.3.1"), ["QUEUE 0 0 0"])
+        self.assertEqual(self.quick_watch(d, "talkstick-0.3.0"), ["QUEUE 0 0 0 0", offer])
+        self.assertEqual(self.quick_watch(d, "talkstick-0.3.1"), ["QUEUE 0 0 0 0"])
         (self.tmp / "ota.key").unlink()
-        self.assertEqual(self.quick_watch(d, "talkstick-0.3.0"), ["QUEUE 0 0 0"])
+        self.assertEqual(self.quick_watch(d, "talkstick-0.3.0"), ["QUEUE 0 0 0 0"])
         self.assertEqual(len(self.events(d, "ota_offer")), 2)
 
     def test_fetch_returns_the_exact_image(self):
@@ -583,6 +636,93 @@ class Queue(unittest.TestCase):
         p = self.ota_cli("--timeout", "0.5", "--version", "talkstick-0.4.0")
         self.assertIn("no stick said hello with talkstick-0.4.0", p.communicate(timeout=10)[1])
         self.assertEqual(p.returncode, 1)
+
+
+FAKE_T3 = """#!/usr/bin/env python3
+import json, os, sys
+d = os.path.dirname(os.path.abspath(__file__))
+scenario = json.load(open(os.path.join(d, 'scenario.json')))
+if sys.argv[1:3] == ['thread', 'send']:
+    with open(os.path.join(d, 'sent.json'), 'a') as f:
+        f.write(json.dumps({'argv': sys.argv[3:], 'text': sys.stdin.read()}) + '\\n')
+    print(json.dumps(scenario['send']))
+    sys.exit(0)
+counter = os.path.join(d, 'shows')
+n = int(open(counter).read()) if os.path.exists(counter) else 0
+open(counter, 'w').write(str(n + 1))
+print(json.dumps(scenario['shows'][min(n, len(scenario['shows']) - 1)]))
+"""
+
+OURS, OTHER = "run:thread:t:ordinal:9", "run:thread:t:ordinal:8"
+
+
+def t3_state(status="running", active=None, msgs=()):
+    return {"thread": {"settled": False, "archived": False, "status": status, "activeRunId": active,
+                       "latestRunId": OURS}, "messages": list(msgs)}
+
+
+USER = {"role": "user", "runId": OURS, "text": "[stick 12:00:00] hello"}
+
+
+class T3Deliver(unittest.TestCase):
+    """examples/t3-driver/deliver.py against a fake t3 CLI that walks a scripted thread."""
+
+    def run_deliver(self, shows, spoken_ago=5.0, **env):
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        d = Path(holder.name)
+        (d / "t3").write_text(FAKE_T3)
+        (d / "t3").chmod(0o755)
+        (d / "scenario.json").write_text(json.dumps(
+            {"send": {"runId": OURS, "status": "queued", "delivery": "queued"}, "shows": shows}))
+        self.spoken = time.time() - spoken_ago
+        p = subprocess.run([sys.executable, str(ROOT / "examples/t3-driver/deliver.py")], input="hello",
+                           capture_output=True, text=True, timeout=30,
+                           env={**os.environ, "T3_BIN": str(d / "t3"), "T3_THREAD": "t", "T3_POLL": "0.01",
+                                "TALKSTICK_SPOKEN_AT": str(self.spoken), **env})
+        sent = [json.loads(l) for l in (d / "sent.json").read_text().splitlines()] if (d / "sent.json").exists() else []
+        return p, sent
+
+    def test_queued_then_paused_then_running_then_replied(self):
+        p, sent = self.run_deliver([
+            t3_state(active=OTHER),
+            t3_state(active=OTHER),
+            t3_state("queued"),
+            t3_state("queued"),
+            t3_state(active=OURS, msgs=[USER]),
+            t3_state("completed", msgs=[USER, {"role": "assistant", "runId": OURS, "text": " hi back "}]),
+        ])
+        self.assertEqual((p.returncode, p.stdout), (0, "@sent\n@busy\n@paused\n@running\nhi back\n"))
+        self.assertEqual(sent[0]["argv"], ["--json", "t", "-"])
+
+    def test_other_runs_text_is_never_the_reply(self):
+        p, _ = self.run_deliver([
+            t3_state(active=OTHER),
+            t3_state(msgs=[{"role": "assistant", "runId": OTHER, "text": "not yours"}], active=OURS),
+            t3_state("completed", msgs=[USER, {"role": "assistant", "runId": OURS, "text": "yours"}]),
+        ])
+        self.assertEqual(p.stdout, "@sent\n@running\nyours\n")
+
+    def test_stopped_turn_gives_the_empty_reply_line(self):
+        p, _ = self.run_deliver([t3_state(active=OTHER), t3_state(active=OURS, msgs=[USER]),
+                                 t3_state("completed", msgs=[USER])])
+        self.assertEqual((p.returncode, p.stdout),
+                         (0, "@sent\n@running\n(the agent finished with no text reply)\n"))
+
+    def test_queue_timeout_exits_4(self):
+        p, _ = self.run_deliver([t3_state(active=OTHER)], T3_QUEUE_TIMEOUT="0.3")
+        self.assertEqual((p.returncode, p.stdout, p.stderr), (4, "@sent\n@busy\n", "still queued in T3\n"))
+
+    def test_spoken_time_prefix(self):
+        done = t3_state("completed", msgs=[USER, {"role": "assistant", "runId": OURS, "text": "ok"}])
+        _, sent = self.run_deliver([t3_state(), done])
+        clock = time.strftime("%H:%M:%S", time.localtime(self.spoken))
+        self.assertEqual(sent[0]["text"], f"[stick {clock}] hello")
+        _, sent = self.run_deliver([t3_state(), done], spoken_ago=150)
+        clock = time.strftime("%H:%M:%S", time.localtime(self.spoken))
+        self.assertEqual(sent[0]["text"], f"[stick {clock}, 2 min late] hello")
+        _, sent = self.run_deliver([t3_state(), done], T3_PREFIX="desk")
+        self.assertTrue(sent[0]["text"].startswith("[desk "))
 
 
 if __name__ == "__main__":

@@ -91,7 +91,7 @@ delivering the next.
 | Line | When |
 |---|---|
 | `TIME <unix-seconds> <utc-offset-seconds>` | on connect, then every 5 s; a stick that hears nothing for 12 s treats the Mac as gone and reconnects |
-| `QUEUE <waiting> <busy> <ahead>` | on connect and whenever it changes. `waiting`: this device's delivered utterances with no answer yet. `busy`: 1 when the target is working on something that is not one of them. `ahead`: turns before the newest waiting utterance starts (0 when it is running or unknown) |
+| `QUEUE <waiting> <busy> <ahead> <paused>` | on connect and whenever it changes. `waiting`: this device's delivered utterances with no answer yet. `busy`: 1 when the target is working on something that is not one of them. `ahead`: turns before the newest waiting utterance starts (0 when it is running or unknown). `paused`: how many of the waiting utterances sit in a target queue that is paused (in T3, after a stopped turn); they move only when something new is sent |
 | `ANSWER <id> <outcome> <said>\t<text>` | on connect for every answer not yet acked (oldest first), then as each arrives. `outcome` is `replied`, `offline` or `error`. `said` is the first 40 characters of the transcript (no tab or newline). `text` is the reply in the form of `REPLY` (at most `stick_reply_chars`, newlines as `\n`, tabs as spaces), or the reason for `offline` and `error` |
 | `OTA <size> <sha256-hex> <mac-hex> <version>` | on connect, and when an image is staged, if the stick's hello named a different version |
 

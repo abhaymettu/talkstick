@@ -22,7 +22,7 @@ Wire protocol M5R1 (docs/protocol.md; one TCP connection per utterance, ping, wa
                SENT [first 40 chars], REPLY <text> (just before REPLIED), REPLIED, OFFLINE, ERR <reason>,
                LAST <text> (on ping, the last reply). REPLY and LAST text: at most stick_reply_chars (600)
                characters, newlines written as the two characters \\n.
-  on a watch   TIME every 5 s, QUEUE <waiting> <busy> <ahead>, ANSWER <id> <outcome> <said>\\t<text>,
+  on a watch   TIME every 5 s, QUEUE <waiting> <busy> <ahead> <paused>, ANSWER <id> <outcome> <said>\\t<text>,
                OTA <size> <sha256> <mac> <version>. On F: IMAGE <size> <sha256>\\n + the raw image, or ERR no image.
   Utterances are delivered in the order their E or S arrived, and the next one is delivered without waiting for
   the previous reply.
@@ -31,15 +31,22 @@ Delivery contract
   print    The transcript is printed to the daemon's stdout. The stick sees SENT, then REPLIED.
   command  argv runs with the transcript on stdin (stdin is then closed). Env: TALKSTICK_DEVICE,
            TALKSTICK_UTTERANCE_ID, TALKSTICK_DRY ("1" in dry mode; the command must then not deliver).
-           A stdout line "@sent" means the text was delivered: the stick sees SENT right away.
+           TALKSTICK_SPOKEN_AT (epoch seconds when the button was released).
+           A stdout line "@sent" means the text was delivered: the stick sees SENT right away. No "@sent"
+           within delivery.command.handoff_timeout seconds (default 45; null = no limit) kills the command and
+           the utterance ends in ERR "not posted: ...", so the stick may resend it.
            After "@sent" and before the reply, the status lines "@busy" (the target is running a turn that is
-           not this message's) and "@running" (this message's turn is running) set the stick's QUEUE; they are
-           never reply text. Everything else on stdout is the reply. Exit 0 = REPLIED, exit 3 = target offline
-           (OFFLINE), any other exit = ERR. No "@sent" before exit 0 means SENT is sent at exit.
+           not this message's), "@paused" (this message is queued and the target's queue is paused) and
+           "@running" (this message's turn is running) set the stick's QUEUE; they are never reply text.
+           Everything else on stdout is the reply. Exit 0 = REPLIED, exit 3 = target offline (OFFLINE), any other
+           exit = ERR with the last stderr line as the reason. No "@sent" before exit 0 means SENT is sent at
+           exit.
   webhook  POST url with JSON {"text", "device", "utterance_id", "dry"}. A JSON body {"reply": "..."}
            or a plain-text body is the reply. 503 = offline. Other non-2xx = ERR.
   on_reply Optional argv run with the reply on stdin, trimmed to reply_max_chars plus reply_more_suffix.
            In dry mode it is printed, not run. offline_message, if set, goes through on_reply on OFFLINE.
+           on_reply_when "unacked" runs it only when the stick has not acked the answer (K) within
+           on_reply_grace seconds; "always" (default) runs it for every reply.
 """
 from __future__ import annotations
 
@@ -105,7 +112,7 @@ DEFAULTS: dict = {
     },
     "delivery": {
         "type": "print",
-        "command": {"argv": [], "timeout": 660},
+        "command": {"argv": [], "timeout": 660, "handoff_timeout": 45},
         "webhook": {"url": "", "headers": {}, "timeout": 660},
     },
     "on_reply": None,
@@ -113,6 +120,8 @@ DEFAULTS: dict = {
     "reply_max_chars": None,
     "reply_more_suffix": " (more)",
     "on_reply_timeout": 90,
+    "on_reply_when": "always",
+    "on_reply_grace": 30,
     "status_prompt": None,
     "stick_reply_chars": STICK_REPLY_CHARS,
     "ota_key_file": "~/.config/talkstick/ota.key",
@@ -242,6 +251,8 @@ class Daemon:
         self.items: dict[str, dict[str, Item]] = {}
         self.watchers: dict[str, list[Watcher]] = {}
         self.queue_sent: dict[str, str] = {}
+        self.ack_cond = threading.Condition(self.lock)
+        self.acked: list[tuple[str, str]] = []
         self.answers: dict[str, list[dict]] = {}
         self.delivered: dict[str, list[list[str]]] = {}
         self.load_answers()
@@ -326,9 +337,9 @@ class Daemon:
 
     def queue_line(self, device: str) -> str:
         waiting = [i for i in self.items.get(device, {}).values() if i.waiting]
-        reports = {i.report for i in waiting}
+        reports = [i.report for i in waiting]
         busy = int("busy" in reports and "running" not in reports)
-        return f"QUEUE {len(waiting)} {busy} {max(len(waiting) - 1, 0) + busy}"
+        return f"QUEUE {len(waiting)} {busy} {max(len(waiting) - 1, 0) + busy} {reports.count('paused')}"
 
     def push(self, device: str, line: str) -> None:
         with self.lock:
@@ -384,6 +395,8 @@ class Daemon:
 
     def ack(self, device: str, aid: str) -> None:
         with self.lock:
+            self.acked = self.acked[-255:] + [(device, aid)]
+            self.ack_cond.notify_all()
             kept = [a for a in self.answers.get(device, []) if a["id"] != aid]
             if len(kept) != len(self.answers.get(device, [])):
                 self.answers[device] = kept
@@ -518,15 +531,29 @@ class Daemon:
 
     def hand_on(self, reply: str, rec: dict) -> None:
         """Run on_reply on its own thread, so a slow phone text never holds up the next utterance. Replies are
-        handed on in order (reply_lock); the outcome is logged as its own "on_reply" event."""
+        handed on in order (reply_lock); the outcome is logged as its own "on_reply" event. With on_reply_when
+        "unacked", a reply the stick acks within on_reply_grace seconds is not handed on."""
         uid, t_release = rec.get("utterance_id"), rec.get("t_release")
+        key = (rec.get("device") or "", (uid or "")[:8])
+        deadline = now() + float(self.cfg["on_reply_grace"])
+        wait = self.cfg["on_reply_when"] == "unacked" and self.cfg.get("on_reply") and reply.strip()
 
         def job() -> None:
             with self.reply_lock:
                 r: dict = {}
+                if wait:
+                    with self.ack_cond:
+                        acked = self.ack_cond.wait_for(lambda: key in self.acked, max(deadline - now(), 0))
+                    if acked:
+                        self.log_event({"event": "on_reply", "utterance_id": uid, "rc": "skipped",
+                                        "decision": "skipped: acked by stick"})
+                        return
+                    r["decision"] = f"sent: not acked in {float(self.cfg['on_reply_grace']):g} s"
                 self.on_reply(reply, r)
                 if "on_reply_rc" in r:
                     row = {"event": "on_reply", "utterance_id": uid, "rc": r["on_reply_rc"]}
+                    if r.get("decision"):
+                        row["decision"] = r["decision"]
                     if t_release and r.get("t_on_reply"):
                         row["d_on_reply"] = round(r["t_on_reply"] - t_release, 3)
                     if r.get("on_reply_error"):
@@ -1136,11 +1163,29 @@ def deliver_command(ccfg: dict, text: str, rec: dict, dry: bool, on_sent, on_sta
     if not argv:
         raise StepError("delivery argv empty")
     env = {**os.environ, "TALKSTICK_DEVICE": str(rec.get("device") or ""),
-           "TALKSTICK_UTTERANCE_ID": rec.get("utterance_id", ""), "TALKSTICK_DRY": "1" if dry else "0"}
+           "TALKSTICK_UTTERANCE_ID": rec.get("utterance_id", ""), "TALKSTICK_DRY": "1" if dry else "0",
+           "TALKSTICK_SPOKEN_AT": str(int(rec.get("t_release") or now()))}
     p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                         text=True, env=env)
-    timer = threading.Timer(float(ccfg.get("timeout", 660)), p.kill)
+                         text=True, env=env, start_new_session=True)
+
+    def kill() -> None:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+    timer = threading.Timer(float(ccfg.get("timeout", 660)), kill)
     timer.start()
+    handoff, posted, missed = ccfg.get("handoff_timeout"), threading.Event(), threading.Event()
+
+    def give_up() -> None:
+        if not posted.is_set():
+            missed.set()
+            kill()
+
+    handoff_timer = threading.Timer(float(handoff), give_up) if handoff else None
+    if handoff_timer:
+        handoff_timer.start()
     try:
         p.stdin.write(text)
         p.stdin.close()
@@ -1151,9 +1196,10 @@ def deliver_command(ccfg: dict, text: str, rec: dict, dry: bool, on_sent, on_sta
         for line in p.stdout:
             word = line.strip()
             if word == "@sent" and not reply:
+                posted.set()
                 on_sent()
                 sent = True
-            elif word in ("@busy", "@running") and sent and not reply:
+            elif word in ("@busy", "@running", "@paused") and sent and not reply:
                 on_status(word[1:])
             else:
                 reply.append(line)
@@ -1161,14 +1207,19 @@ def deliver_command(ccfg: dict, text: str, rec: dict, dry: bool, on_sent, on_sta
         drain.join(5)
     finally:
         timer.cancel()
+        if handoff_timer:
+            handoff_timer.cancel()
         p.stdout.close()
         p.stderr.close()
     rec["delivery_rc"] = rc
+    if missed.is_set():
+        raise StepError(f"not posted: the thread did not take it in {float(handoff):g} s")
     if rc == EXIT_OFFLINE:
         raise Offline()
     if rc != 0:
         rec["delivery_stderr"] = "".join(err).strip()[-200:]
-        raise StepError(f"delivery exit {rc}")
+        lines = rec["delivery_stderr"].splitlines()
+        raise StepError(lines[-1].strip() if lines else f"delivery exit {rc}")
     on_sent()
     return "".join(reply).strip()
 
@@ -1396,8 +1447,8 @@ def status_cmd(d: Daemon) -> None:
     except (OSError, ValueError):
         queues = {}
     for device, q in queues.items():
-        waiting, busy, ahead = q["queue"]
-        print(f"queue {device}: waiting {waiting} busy {busy} ahead {ahead}")
+        waiting, busy, ahead, paused = q["queue"]
+        print(f"queue {device}: waiting {waiting} busy {busy} ahead {ahead} paused {paused}")
         for i in q["items"]:
             print(f"  {i['id']} {i['state']} {now() - i['since']:.0f}s")
     m = load_manifest(d.state)

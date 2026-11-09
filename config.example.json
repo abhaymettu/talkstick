@@ -40,9 +40,11 @@
     "_types": "print (stdout), command, webhook",
     "type": "print",
     "command": {
-      "_contract": "transcript on stdin; print a line @sent once delivered (stick shows SENT); after @sent and before the reply, the status lines @busy (the target is running a turn that is not this message's) and @running (this message's turn is running) set the stick's queue and are never reply text; everything else printed is the reply; exit 0 = REPLIED, exit 3 = target offline (OFFLINE), other nonzero = ERR. Env: TALKSTICK_DEVICE, TALKSTICK_UTTERANCE_ID, TALKSTICK_DRY (1 = do not deliver)",
+      "_contract": "transcript on stdin; print a line @sent once delivered (stick shows SENT); after @sent and before the reply, the status lines @busy (the target is running a turn that is not this message's), @paused (this message is queued and the target's queue is paused) and @running (this message's turn is running) set the stick's queue and are never reply text; everything else printed is the reply; exit 0 = REPLIED, exit 3 = target offline (OFFLINE), other nonzero = ERR with the last stderr line as the reason. Env: TALKSTICK_DEVICE, TALKSTICK_UTTERANCE_ID, TALKSTICK_SPOKEN_AT (epoch seconds of the button release), TALKSTICK_DRY (1 = do not deliver)",
       "argv": ["python3", "/path/to/my-deliver.py"],
-      "timeout": 660
+      "timeout": 660,
+      "handoff_timeout": 45,
+      "_handoff_timeout": "seconds the command has to print @sent; past that it is killed and the stick gets ERR not posted (and may resend); null = no limit"
     },
     "webhook": {
       "_contract": "POST {\"text\", \"device\", \"utterance_id\", \"dry\"}; reply = JSON {\"reply\": \"...\"} or a plain-text body; 503 = offline; other non-2xx = ERR",
@@ -55,6 +57,9 @@
   "on_reply": null,
   "on_reply_timeout": 90,
   "_on_reply": "argv run with the reply on stdin, e.g. [\"notify-send\", \"talkstick\"] or a script that texts your phone; printed instead of run in dry mode",
+  "on_reply_when": "always",
+  "on_reply_grace": 30,
+  "_on_reply_when": "\"always\" runs on_reply for every reply; \"unacked\" runs it (and offline_message) only when the stick has not acked that answer on its watch connection within on_reply_grace seconds, so a reply you already read on the stick does not also text your phone",
   "offline_message": null,
   "_offline_message": "if set, sent through on_reply when the target is offline",
   "reply_max_chars": null,

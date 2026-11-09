@@ -110,9 +110,12 @@ connection may ask the macOS firewall for permission for the Python that runs it
 Delivery is a command or a webhook, so anything you can script works.
 
 **A command.** The transcript arrives on stdin. Print `@sent` once it is delivered (the stick shows *Sent*), then
-print the reply. Exit 3 means the target is offline. Optionally, between `@sent` and the reply, print `@busy` while
-the target is busy with something else and `@running` once it works on this message; the stick shows its place in
-the queue.
+print the reply. Exit 3 means the target is offline; any other failure exits nonzero with a short reason as the last
+stderr line, which the stick shows. Print `@sent` within 45 s (`handoff_timeout`) or the command is stopped and the
+stick shows *not posted*. Optionally, between `@sent` and the reply, print `@busy` while the target is busy with
+something else, `@paused` while this message waits in a paused queue, and `@running` once the target works on this
+message; the stick shows its place in the queue. `TALKSTICK_SPOKEN_AT` holds the epoch second the button was
+released.
 
 ```json
 "delivery": {"type": "command", "command": {"argv": ["/path/to/ask-my-agent.sh"], "timeout": 600}}
@@ -146,6 +149,7 @@ Examples:
 | `delivery.type` | `print` | `print`, `command`, `webhook` |
 | `status_prompt` | null | the text sent when A is tapped |
 | `on_reply`, `on_reply_timeout` | null, 90 | command run with the reply; seconds before it is abandoned |
+| `on_reply_when`, `on_reply_grace` | `always`, 30 | `unacked`: run `on_reply` only for answers the stick has not acked within the grace seconds |
 | `reply_max_chars`, `reply_more_suffix` | null, " (more)" | trims what `on_reply` gets |
 | `stick_reply_chars` | 600 | longest reply sent to the screen |
 | `offline_message` | null | sent through `on_reply` when the target is offline |
