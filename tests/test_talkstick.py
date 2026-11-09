@@ -3,6 +3,7 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import time
 import struct
 import sys
 import tempfile
@@ -182,18 +183,31 @@ class Pipeline(unittest.TestCase):
 
     def test_failing_on_reply_keeps_the_reply(self):
         d, _ = self.daemon("print('done')", on_reply=py("import sys; sys.exit(1)"))
-        lines, events = self.run_stick(d)
+        lines, _ = self.run_stick(d)
+        d.wait_replies()
+        events = [json.loads(l) for l in d.events.read_text().splitlines()]
         self.assertEqual(lines[-2:], ["REPLY done", "REPLIED"])
-        row = [e for e in events if e.get("event") == "utterance"][-1]
-        self.assertEqual((row["outcome"], row["on_reply_rc"]), ("replied", 1))
+        self.assertEqual([e for e in events if e.get("event") == "utterance"][-1]["outcome"], "replied")
+        self.assertEqual([e for e in events if e.get("event") == "on_reply"][-1]["rc"], 1)
 
     def test_on_reply_timeout_is_logged_not_raised(self):
         d, _ = self.daemon("print('done')", on_reply=py("import time; time.sleep(5)"), on_reply_timeout=0.2)
-        lines, events = self.run_stick(d)
+        lines, _ = self.run_stick(d)
+        d.wait_replies()
+        events = [json.loads(l) for l in d.events.read_text().splitlines()]
         self.assertEqual(lines[-1], "REPLIED")
-        row = [e for e in events if e.get("event") == "utterance"][-1]
-        self.assertEqual(row["on_reply_rc"], "failed")
-        self.assertIn("TimeoutExpired", row["on_reply_error"])
+        row = [e for e in events if e.get("event") == "on_reply"][-1]
+        self.assertEqual(row["rc"], "failed")
+        self.assertIn("TimeoutExpired", row["error"])
+
+    def test_slow_on_reply_does_not_hold_the_next_utterance(self):
+        d, _ = self.daemon("print('done')", on_reply=py("import time; time.sleep(3)"))
+        self.run_stick(d)
+        t0 = time.time()
+        lines, _ = self.run_stick(d)
+        self.assertEqual(lines[-1], "REPLIED")
+        self.assertLess(time.time() - t0, 2.5)
+        d.wait_replies()
 
     def test_offline(self):
         d, _ = self.daemon("import sys; sys.exit(3)")

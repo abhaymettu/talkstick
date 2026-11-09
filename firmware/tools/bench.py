@@ -81,9 +81,11 @@ def main():
             s.write(f"pcm {len(pcm)}\n".encode())
             if not listen(s, 3, until="pcm ready"):
                 sys.exit("stick did not answer pcm")
-            for off in range(0, len(pcm), 4096):
-                s.write(pcm[off:off + 4096])
-            s.flush()
+            # Paced: the stick's USB receive ring drops bytes if the host writes at full speed.
+            for off in range(0, len(pcm), 1024):
+                s.write(pcm[off:off + 1024])
+                s.flush()
+                time.sleep(0.004)
             print(f"pushed {len(pcm)} bytes ({len(pcm) / 32000:.2f} s)", flush=True)
             listen(s, args.listen)
 

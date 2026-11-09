@@ -150,6 +150,8 @@ class Daemon:
         self.events = self.state / "events.jsonl"
         self.events_lock = threading.Lock()
         self.work_lock = threading.Lock()
+        self.reply_lock = threading.Lock()
+        self.reply_threads: list = []
 
     @property
     def dry(self) -> bool:
@@ -226,7 +228,31 @@ class Daemon:
         rec["t_on_reply"] = now()
         if rec["on_reply_rc"] != 0:
             rec["on_reply_error"] = err
-            self.log_event({"event": "on_reply_failed", "rc": rec["on_reply_rc"], "stderr": err})
+
+    def hand_on(self, reply: str, rec: dict) -> None:
+        """Run on_reply on its own thread, so a slow phone text never holds up the next utterance. Replies are
+        handed on in order (reply_lock); the outcome is logged as its own "on_reply" event."""
+        uid, t_release = rec.get("utterance_id"), rec.get("t_release")
+
+        def job() -> None:
+            with self.reply_lock:
+                r: dict = {}
+                self.on_reply(reply, r)
+                if "on_reply_rc" in r:
+                    row = {"event": "on_reply", "utterance_id": uid, "rc": r["on_reply_rc"]}
+                    if t_release and r.get("t_on_reply"):
+                        row["d_on_reply"] = round(r["t_on_reply"] - t_release, 3)
+                    if r.get("on_reply_error"):
+                        row["error"] = r["on_reply_error"]
+                    self.log_event(row)
+
+        t = threading.Thread(target=job, daemon=True)
+        self.reply_threads = [x for x in self.reply_threads if x.is_alive()] + [t]
+        t.start()
+
+    def wait_replies(self, timeout: float = 10) -> None:
+        for t in list(self.reply_threads):
+            t.join(timeout)
 
     # Pipeline
 
@@ -278,12 +304,12 @@ class Daemon:
                 rec["t_done"] = now()
                 rec["outcome"] = "replied"
                 status("REPLIED")
-                self.on_reply(reply, rec)
+                self.hand_on(reply, rec)
             except Offline:
                 rec["outcome"] = "offline"
                 status("OFFLINE")
                 if self.cfg.get("offline_message"):
-                    self.on_reply(self.cfg["offline_message"], rec)
+                    self.hand_on(self.cfg["offline_message"], rec)
             except StepError as e:
                 rec["outcome"], rec["error"] = "error", str(e)
                 status(f"ERR {e}"[:60])
@@ -292,7 +318,7 @@ class Daemon:
                 status("ERR internal")
             finally:
                 r = rec.get("t_release")
-                for k in ("t_transcript", "t_sent", "t_reply", "t_done", "t_on_reply"):
+                for k in ("t_transcript", "t_sent", "t_reply", "t_done"):
                     if r and rec.get(k):
                         rec["d_" + k[2:]] = round(rec[k] - r, 3)
                 rec["dry"] = self.dry
