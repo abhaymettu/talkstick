@@ -6,10 +6,10 @@ The stick streams your voice over WiFi to a small daemon on your computer, the d
 to a command or URL you choose, and sends the reply back to the stick's screen.
 
 <p align="center">
-  <img src="docs/screens/idle.png" width="240" alt="Idle screen: clock, battery, WiFi, Mac reachable">
+  <img src="docs/screens/idle.png" width="240" alt="Home screen: clock, Ready, WiFi, battery">
   <img src="docs/screens/listening.png" width="240" alt="Listening screen with level bar">
   <img src="docs/screens/thinking.png" width="240" alt="Thinking screen while the reply is pending">
-  <img src="docs/screens/replied.png" width="240" alt="Replied screen with the reply text">
+  <img src="docs/screens/replied.png" width="240" alt="Reply screen with what you said and the reply">
 </p>
 
 ```
@@ -19,7 +19,7 @@ to a command or URL you choose, and sends the reply back to the stick's screen.
  │ 16 kHz PCM   │   M5R1 frames     │  ├ engine:   whisper.cpp | command | (Wispr)  │
  │              │                   │  ├ delivery: command | webhook | print        │
  │ screen:      │ ◀───────────────  │  └ on_reply: optional command (phone, notify) │
- │ sent, reply  │   status lines    └──────────────────────────────────────────────┘
+ │ state, reply │   status lines    └──────────────────────────────────────────────┘
  └──────────────┘
 ```
 
@@ -30,17 +30,28 @@ whisper.cpp and the default delivery just prints the text.
 
 - **Hold A** to talk. The mic runs while the stick is awake, so recording starts the instant you press; after a
   deep-sleep wake the screen says *Wait* for about a second until audio flows, then *Listening*.
-- **Release** and the stick shows *Sent*, then *Thinking* with the elapsed time, then the reply itself.
-- **Tap A** sends a status question you set in the config (for example "one line on what is running").
-- **B while talking** cancels. **B otherwise** shows the last reply again and pages through it.
-- Quiet, distinct clicks for sent, replied and problems (`sound off` on the serial console mutes them). There is no
-  click on press: the speaker shares the codec with the mic, and restarting the mic after a click cost 0.9 s of speech.
-- Idle screen: clock (from the daemon, no internet needed), battery, WiFi strength, and whether the daemon is reachable.
-- On battery it deep-sleeps when idle and wakes on button A; on USB it stays awake with the screen dimmed.
-
-Every element on screen has one job, listed in [firmware/README-firmware.md](firmware/README-firmware.md#screens-and-what-each-element-is-for).
-Colours come from the Okabe-Ito set with clear lightness steps, and every state is also named in words, so the screen
-reads the same for colour-blind eyes.
+- **Release** and the stick shows *Sending* until the daemon confirms the text reached your target by its id, then
+  *Delivered*. If the daemon or WiFi is gone it says *Not sent yet* and tries again with the same id (the daemon drops
+  duplicates); after two minutes it says *Not sent* and asks you to say it again. It never shows *Delivered* on a guess.
+- **While you wait** the screen says what the target is doing: *Thinking* when it works on your message, *Queued* with
+  how many are ahead when it is busy, *Paused* when its queue is stopped. You can keep talking; every message is
+  delivered as soon as you release, and *N waiting* counts the replies still to come.
+- **Replies** arrive in the order you spoke them, each next to what you said. **B** pages a long reply, then the next
+  one, then home. **B** on the home screen shows the newest reply again.
+- **Tap A** sends a status question you set in the config (for example "one line on what is running"); a second tap
+  while one is waiting says *Already asked*.
+- **B while talking** cancels.
+- Home screen: clock (from the daemon, no internet needed), *Ready* or what is missing (*Joining WiFi*, *Finding the
+  Mac*, *Can't reach the Mac*), WiFi, battery and charge state in words, and the firmware version. The Mac status comes
+  from a live connection to the daemon, so it changes within about a second of the daemon starting or stopping.
+- **Updates over WiFi.** `talkstick ota <image>` offers a signed image; the stick checks its sha256, writes the spare
+  slot, restarts into it, and keeps it only after it reaches the daemon again. Otherwise it rolls back.
+- Quiet, distinct clicks for delivered, replied and problems (`sound off` on the serial console mutes them). There is
+  no click on press: the speaker shares the codec with the mic, and restarting the mic after a click cost 0.9 s of
+  speech.
+- On battery it deep-sleeps when idle and wakes on button A, but not while replies are still due; on USB it stays
+  awake with the screen dimmed.
+- Colours follow the Okabe-Ito set with different lightness for each meaning, and every state is also named in words.
 
 ## You need
 
@@ -89,7 +100,7 @@ cp config.example.json ~/.config/talkstick/config.json
 daemon/talkstick serve
 ```
 
-Hold A and speak: the transcript prints in the daemon's terminal, and the stick shows *Sent* then *Replied*. Test it
+Hold A and speak: the transcript prints in the daemon's terminal, and the stick shows *Delivered* then the reply. Test it
 without the stick:
 
 ```sh
@@ -109,7 +120,7 @@ connection may ask the macOS firewall for permission for the Python that runs it
 
 Delivery is a command or a webhook, so anything you can script works.
 
-**A command.** The transcript arrives on stdin. Print `@sent` once it is delivered (the stick shows *Sent*), then
+**A command.** The transcript arrives on stdin. Print `@sent` once it is delivered (the stick shows *Delivered*), then
 print the reply. Exit 3 means the target is offline; any other failure exits nonzero with a short reason as the last
 stderr line, which the stick shows. Print `@sent` within 45 s (`handoff_timeout`) or the command is stopped and the
 stick shows *not posted*. Optionally, between `@sent` and the reply, print `@busy` while the target is busy with
@@ -173,7 +184,7 @@ The wire protocol (M5R1) is small enough to implement on another device: [docs/p
   BlackHole virtual mic, needs the user idle while it runs, and can paste into the focused app. Use whisper unless
   you know you want it.
 - **Mic and speaker** share one codec, so clicks play only after a recording.
-- **WiFi names are case sensitive.** If the idle screen says *no wifi*, check the exact capitalisation of the network
+- **WiFi names are case sensitive.** If the home screen says *No WiFi*, check the exact capitalisation of the network
   name; `scan` on the serial console reports whether a network with that name is visible.
 
 ## Hardware notes
